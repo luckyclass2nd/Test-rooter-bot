@@ -1,1 +1,2 @@
-# Test-rooter-bot
+# rooter-auto-buyer
+Rooter PlayStation monitoring and account automation
