@@ -7,7 +7,7 @@ import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -32,6 +32,8 @@ def log_step(slot_id: str, msg: str):
 
 class AccountController:
 
+    VALID_DENOMS = ("1000", "2000", "3000", "4000", "5000")
+
     def __init__(
         self,
         browser: BrowserManager,
@@ -45,11 +47,52 @@ class AccountController:
         self.screenshots_dir = Path(settings.screenshots_dir)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
+        # Pre-feedable Target Denomination & Quantity (Persisted on disk)
+        self.settings_file = Path(settings.sessions_dir) / "swarm_target_config.json"
+        self.target_denom: str = "5000"
+        self.target_qty: int = 1
+        self._load_target_config()
+
         self.stock_event = asyncio.Event()
         self.sniper_tasks: Dict[str, asyncio.Task] = {}
 
         self._create_slots()
-        log_step("SYSTEM", f"Controller initialized for Service ID {settings.current_service_id}")
+        log_step(
+            "SYSTEM",
+            f"Controller initialized | Target: Rs.{self.target_denom} | Pre-Fed Qty: {self.target_qty}",
+        )
+
+    # =========================================================
+    # PRE-FED TARGET DENOMINATION & QUANTITY PERSISTENCE
+    # =========================================================
+
+    def _load_target_config(self):
+        try:
+            if self.settings_file.exists():
+                data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                denom = str(data.get("target_denom", "5000")).strip()
+                qty = int(data.get("target_qty", 1))
+                if denom in self.VALID_DENOMS:
+                    self.target_denom = denom
+                if qty in (1, 2):
+                    self.target_qty = qty
+        except Exception as e:
+            log_step("CONFIG", f"Target config load note: {e}")
+
+    def _save_target_config(self):
+        try:
+            self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_file.write_text(
+                json.dumps(
+                    {
+                        "target_denom": self.target_denom,
+                        "target_qty": self.target_qty,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log_step("CONFIG", f"Target config save note: {e}")
 
     # =========================================================
     # SLOT MANAGEMENT & AUTO SESSION RESTORE
@@ -102,6 +145,10 @@ class AccountController:
     def connect_commands(self):
         self.telegram.register_command("start", self.handle_start)
         self.telegram.register_command("status", self.handle_status)
+        self.telegram.register_command("denom", self.handle_set_denom)
+        self.telegram.register_command("target", self.handle_set_denom)
+        self.telegram.register_command("code", self.handle_set_denom)
+        self.telegram.register_command("qty", self.handle_set_qty)
         self.telegram.register_command("login", self.handle_login)
         self.telegram.register_command("otp", self.handle_otp)
         self.telegram.register_command("cookie", self.handle_cookie_import)
@@ -116,6 +163,72 @@ class AccountController:
         self.telegram.register_command("heal", self.handle_heal)
 
     # =========================================================
+    # NEW: PRE-FEED DENOMINATION (/denom) & QUANTITY (/qty)
+    # =========================================================
+
+    async def handle_set_denom(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            return await update.message.reply_text(
+                f"🎯 Current Target Code: Rs.{self.target_denom} Wallet Code\n"
+                f"📦 Current Target Quantity: {self.target_qty}\n\n"
+                "Change karne ke liye bhej:\n"
+                "`/denom 1000`\n"
+                "`/denom 2000`\n"
+                "`/denom 3000`\n"
+                "`/denom 4000`\n"
+                "`/denom 5000`"
+            )
+
+        raw_val = re.sub(r"[^\d]", "", context.args[0].strip())
+        if raw_val not in self.VALID_DENOMS:
+            return await update.message.reply_text(
+                "❌ Valid denomination daal bhai: `1000`, `2000`, `3000`, `4000`, ya `5000`\n"
+                "Example: `/denom 2000`"
+            )
+
+        self.target_denom = raw_val
+        self._save_target_config()
+        self._ensure_snipers_running()
+
+        qty_mode_str = (
+            "1 (Direct Fast Buy - No '+' Click)"
+            if self.target_qty == 1
+            else "2 (Clicks '+' for Qty 2, Smart Fallback to Qty 1)"
+        )
+        await update.message.reply_text(
+            f"🎯 Target Denomination Locked: **Rs.{self.target_denom} Wallet Code**!\n"
+            f"📦 Pre-Fed Quantity: **{qty_mode_str}**\n"
+            f"🔫 Saare accounts ab Rs.{self.target_denom} ka code snipe karenge!"
+        )
+
+    async def handle_set_qty(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args or context.args[0].strip() not in ("1", "2"):
+            return await update.message.reply_text(
+                f"📦 Current Pre-Fed Quantity: **{self.target_qty}**\n\n"
+                "Change karne ke liye bhej:\n"
+                "• `/qty 1` -> Quantity nahi chhedega, seedha ultra-fast 1 code buy karega!\n"
+                "• `/qty 2` -> '+' daba kar 2 code buy karega (agar 2 ka balance kam hua toh 1 lega)."
+            )
+
+        self.target_qty = int(context.args[0].strip())
+        self._save_target_config()
+        self._ensure_snipers_running()
+
+        if self.target_qty == 1:
+            msg = (
+                f"⚡ **Pre-Fed Quantity Set to 1!**\n"
+                f"🎯 Target: **Rs.{self.target_denom} Wallet Code x 1**\n"
+                "🚀 Ab bot '+' button bilkul nahi chhedega—stock dikhte hi seedha `Pay via wallet` thokega!"
+            )
+        else:
+            msg = (
+                f"➕ **Pre-Fed Quantity Set to 2!**\n"
+                f"🎯 Target: **Rs.{self.target_denom} Wallet Code x 2**\n"
+                "🚀 Stock dikhte hi '+' daba kar Qty 2 buy karega (aur balance kam hone par turant Qty 1 lega)!"
+            )
+        await update.message.reply_text(msg)
+
+    # =========================================================
     # START / HELP / STATUS / HEAL
     # =========================================================
 
@@ -123,19 +236,24 @@ class AccountController:
         auto_started = self._ensure_snipers_running()
         extra_msg = f"\n🚀 Auto-resumed {auto_started} saved sessions!" if auto_started > 0 else ""
         await update.message.reply_text(
-            "🤖 Rooter Auto Buyer (Argon Swarm Pro Mode)\n\n"
-            f"Total slots: {settings.total_slots}\n"
-            f"Current Service ID: {settings.current_service_id}\n"
-            f"Accounts/service: {settings.accounts_per_service}\n"
-            f"{extra_msg}\n"
-            "System Online & Swarm-Ready. Use /status to monitor."
+            "🤖 Rooter Auto Buyer (Argon Swarm Ultra Pro)\n\n"
+            f"🎯 Target Denomination: Rs.{self.target_denom} Wallet Code\n"
+            f"📦 Pre-Fed Quantity: {self.target_qty}\n"
+            f"🎰 Total Slots: {settings.total_slots} (Service {settings.current_service_id})\n"
+            f"{extra_msg}\n\n"
+            "Use /denom 2000 to change target code & /qty 1 or /qty 2 to pre-feed quantity."
         )
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "📖 ARGON SWARM PRO COMMANDS\n\n"
-            "/status - Live status, balance & last check time\n"
-            "/cookie S1-A1 <token> - Instant Token Login (Unique Device Lock)\n"
+            "📖 ARGON SWARM ULTRA PRO COMMANDS\n\n"
+            "🎯 **Pre-Feed Target & Quantity:**\n"
+            "/denom 2000 - Set target code (1000/2000/3000/4000/5000)\n"
+            "/qty 1 - Set Qty 1 (No '+' click, direct fast buy)\n"
+            "/qty 2 - Set Qty 2 (Clicks '+', smart fallback to 1)\n\n"
+            "🔐 **Account & Sniper Controls:**\n"
+            "/status - Live status, target, balance & stage\n"
+            "/cookie S1-A1 <token> - Instant Token Login\n"
             "/login S1-A1 9876543210 - Human Login with Phone\n"
             "/otp S1-A1 123456 - Submit OTP\n"
             "/popup S1-A1 - Force dismiss location popup\n"
@@ -150,7 +268,13 @@ class AccountController:
 
     async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._ensure_snipers_running()
-        lines = ["📊 SWARM ACCOUNT STATUS", ""]
+        qty_desc = "1 (Direct Fast Buy)" if self.target_qty == 1 else "2 (Auto Fallback -> 1)"
+        lines = [
+            "📊 SWARM ACCOUNT STATUS",
+            f"🎯 Target Code: Rs.{self.target_denom} Wallet Code",
+            f"📦 Pre-Fed Qty: {qty_desc}",
+            "",
+        ]
 
         for account in self.all_accounts():
             phone = account.phone_number if account.phone_number else "Saved Session"
@@ -217,7 +341,6 @@ class AccountController:
             slot_id = ""
             raw_input = ""
 
-            # Case 1: Uploaded .json file
             if update.message and update.message.document:
                 if context.args:
                     slot_id = context.args[0].upper()
@@ -233,7 +356,6 @@ class AccountController:
                 file_bytes = await tg_file.download_as_bytearray()
                 raw_input = file_bytes.decode("utf-8").strip()
             else:
-                # Case 2: Text command (/cookie S1-A1 <token_or_json>)
                 if not context.args or len(context.args) < 2:
                     return await update.message.reply_text(
                         "❌ Format:\n`/cookie S1-A1 <user_auth_value>`\n"
@@ -245,7 +367,6 @@ class AccountController:
             account = self.get_account(slot_id)
             await update.message.reply_text(f"⏳ Injecting isolated device session into {slot_id}...")
 
-            # Pause existing sniper while resetting context
             old_task = self.sniper_tasks.pop(slot_id, None)
             if old_task and not old_task.done():
                 old_task.cancel()
@@ -256,7 +377,6 @@ class AccountController:
             extracted_device_id = str(uuid.uuid4())
             decoded_user_auth_str = ""
 
-            # Check if full JSON array or short user_auth token
             if raw_input.startswith("["):
                 parsed_list = json.loads(raw_input)
                 has_client_id = False
@@ -335,10 +455,8 @@ class AccountController:
                     },
                 ])
 
-            # 1. Close old browser context for this slot
             await self.browser.close_slot(slot_id)
 
-            # 2. Write storage_state.json with cookies & localStorage origins
             origins_data = [
                 {
                     "origin": "https://shop.rooter.gg",
@@ -361,7 +479,6 @@ class AccountController:
             storage_file = session_dir / "storage_state.json"
             storage_file.write_text(json.dumps({"cookies": playwright_cookies, "origins": origins_data}))
 
-            # 3. Open fresh context & product page, verify balance & save state
             page = await self.browser.open_product_page(slot_id)
             await self._destroy_location_popup(page, slot_id)
             await asyncio.sleep(1.0)
@@ -377,14 +494,14 @@ class AccountController:
             )
             log_step(slot_id, f"Cookie session live-loaded ({user_label} | DevID: {extracted_device_id[:8]}) | {balance_txt}")
 
-            # 4. Auto-start Sniper
             self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
 
             await update.message.reply_text(
                 f"✅ Success! {slot_id} Live Logged-In ({user_label})!\n"
                 f"📱 Isolated Device ID: `{extracted_device_id[:12]}...`\n"
                 f"💰 Wallet: {balance_txt}\n"
-                f"🔫 Swarm Sniper Auto-Started! Ab `/screen {slot_id}` bhej kar dekh le!"
+                f"🎯 Target: Rs.{self.target_denom} x {self.target_qty}\n"
+                f"🔫 Swarm Sniper Auto-Started!"
             )
         except Exception as exc:
             log_step("COOKIE_ERR", f"Failed: {exc}")
@@ -415,17 +532,11 @@ class AccountController:
             await update.message.reply_text(f"❌ Force popup failed: {exc}")
 
     async def _destroy_location_popup(self, page, slot_id: str = "SLOT"):
-        """
-        1. Real Human Click via BrowserManager.
-        2. Fallback DOM Vaporizer if modal still lingers.
-        3. Auto-return to PlayStation product page if redirected.
-        """
         try:
             await self.browser.handle_location_popup(page, slot_id)
         except Exception:
             pass
 
-        # Fallback: If 'Different Location Detected' still visible, click 'No, stay' or remove modal
         try:
             await page.evaluate("""() => {
                 const allEls = Array.from(document.querySelectorAll('button, p, span, div, a'));
@@ -447,10 +558,15 @@ class AccountController:
 
         try:
             curr_url = (page.url or "").lower()
-            if curr_url and "playstation" not in curr_url and "about:blank" not in curr_url:
+            if (
+                curr_url
+                and "playstation" not in curr_url
+                and "order" not in curr_url
+                and "about:blank" not in curr_url
+            ):
                 log_step(slot_id, f"Redirected to {curr_url}! Returning to PlayStation product page...")
                 await page.goto(settings.product_url, wait_until="domcontentloaded", timeout=35000)
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.0)
                 await self.browser.handle_location_popup(page, slot_id)
         except Exception as e:
             log_step(slot_id, f"URL check note: {e}")
@@ -459,7 +575,7 @@ class AccountController:
         wallet_balance_text = "Balance info not found"
         try:
             balance_locator = page.locator("text=/Wallet Balance/i >> visible=true").first
-            if await balance_locator.is_visible(timeout=1500):
+            if await balance_locator.is_visible(timeout=1200):
                 wallet_balance_text = await balance_locator.inner_text()
                 nums = re.findall(r"\d+(?:\.\d+)?", wallet_balance_text.replace(",", ""))
                 if nums:
@@ -508,7 +624,6 @@ class AccountController:
         if mobile_input is not None:
             return mobile_input
 
-        # Step 1: Click exact rightmost SVG icon in the top navbar (Profile Icon)
         try:
             icon_info = await page.evaluate("""() => {
                 const svgs = Array.from(document.querySelectorAll('svg'));
@@ -541,7 +656,6 @@ class AccountController:
         except Exception as e:
             log_step(slot_id, f"SVG icon click note: {e}")
 
-        # Step 2: Check if clicking profile icon opened a dropdown/menu with "Login" button
         login_texts = [
             page.get_by_text("Login / Sign Up", exact=False),
             page.get_by_text("Login / Signup", exact=False),
@@ -561,7 +675,6 @@ class AccountController:
             except Exception:
                 pass
 
-        # Step 3: Fallback coordinates for top-right profile icon (both 1280 and 1200 widths)
         for coord_x in [1208, 1143, 1225]:
             try:
                 await page.mouse.move(coord_x, 36, steps=5)
@@ -573,7 +686,6 @@ class AccountController:
             except Exception:
                 pass
 
-        # Step 4: Click "Apply Coupons" or "Login to" on page which also triggers login modal
         extra_triggers = [
             page.locator("button:has-text('Login to')"),
             page.get_by_text("Apply Coupons", exact=False),
@@ -803,9 +915,7 @@ class AccountController:
             )
             await verify_button.click(force=True, timeout=3000)
 
-            # 1. Wait for Rooter's own post-OTP popup close / auto-refresh to settle
             ctx = await self.browser.get_context(slot_id)
-            auth_verified = False
 
             for _ in range(20):
                 await asyncio.sleep(0.6)
@@ -816,16 +926,12 @@ class AccountController:
                         "() => { try { return localStorage.getItem('user_auth') || sessionStorage.getItem('user_auth'); } catch(e) { return null; } }"
                     )
                     if cookie_auth or ls_auth:
-                        auth_verified = True
                         break
                 except Exception:
-                    # Page may be mid-reload by Rooter right after OTP verify
                     pass
 
-            # Wait 3s more for Rooter navbar (pink profile icon) to finish rendering
             await asyncio.sleep(3.0)
 
-            # 2. Make all session cookies permanent so /refresh never drops login
             try:
                 cookies = await ctx.cookies()
                 persistent_cookies = []
@@ -858,7 +964,6 @@ class AccountController:
             except Exception as sync_err:
                 log_step(slot_id, f"Cookie sync note: {sync_err}")
 
-            # 3. Only navigate if page somehow left the product URL
             if "playstation-gift-cards" not in (page.url or "").lower():
                 try:
                     await page.goto(settings.product_url, wait_until="domcontentloaded", timeout=25000)
@@ -869,7 +974,6 @@ class AccountController:
             await self._destroy_location_popup(page, slot_id)
             balance_txt = await self._update_live_balance(page, account)
 
-            # 4. IMMEDIATELY save session to disk so /refresh & 30s Sniper keep the pink icon
             await self.browser.save_session(slot_id, account.phone_number)
 
             account.update(logged_in=True, active=True, current_page="✅ Logged In & Saved", last_error=None)
@@ -909,7 +1013,10 @@ class AccountController:
             await page.screenshot(path=str(screenshot_path), full_page=False)
             await self.telegram.send_photo(
                 photo_path=str(screenshot_path),
-                caption=f"🖥 {slot_id}\nState: {account.current_page}",
+                caption=(
+                    f"🖥 {slot_id} | Target: Rs.{self.target_denom} x {self.target_qty}\n"
+                    f"State: {account.current_page}"
+                ),
             )
             if screenshot_path.exists():
                 screenshot_path.unlink()
@@ -940,7 +1047,7 @@ class AccountController:
             await self.browser.save_session(slot_id, account.phone_number)
 
             account.update(logged_in=True, active=True, current_page="🔄 Manually Refreshed", last_error=None)
-            await update.message.reply_text(f"🔄 Hard Refreshed {slot_id} (Session & Indian Region Active)")
+            await update.message.reply_text(f"🔄 Hard Refreshed {slot_id} (Target: Rs.{self.target_denom} x {self.target_qty})")
 
             task = self.sniper_tasks.get(slot_id)
             if task is None or task.done():
@@ -992,8 +1099,192 @@ class AccountController:
             await update.message.reply_text(f"❌ Logout failed: {exc}")
 
     # =========================================================
+    # 🎯 FAST TARGET SELECTOR & ORDER PAGE CODE EXTRACTOR
+    # =========================================================
+
+    async def _select_target_denomination(self, page, denom: str) -> str:
+        """
+        Clicks 'Rs.<denom> Wallet Code' as soon as it is rendered on the page.
+        Returns:
+          - 'clicked' if in-stock card was clicked
+          - 'oos' if the target card explicitly says 'Out of Stock'
+          - 'not_found' if card didn't render
+        """
+        target_label = f"Rs.{denom} Wallet Code"
+        for _ in range(35):
+            res = await page.evaluate(
+                """(label) => {
+                    const lowerLabel = label.toLowerCase();
+                    const els = Array.from(document.querySelectorAll('div, button, span, p'));
+                    for (const el of els) {
+                        const t = (el.innerText || '').trim();
+                        const tl = t.toLowerCase();
+                        if (tl === lowerLabel || tl.startsWith(lowerLabel + '\\n')) {
+                            const card = el.parentElement || el;
+                            const cardTxt = (card.innerText || t).toLowerCase();
+                            if (cardTxt.includes('out of stock')) {
+                                return 'oos';
+                            }
+                            if (cardTxt.includes('₹') || cardTxt.includes('rs.')) {
+                                el.click();
+                                card.click();
+                                return 'clicked';
+                            }
+                        }
+                    }
+                    return 'waiting';
+                }""",
+                target_label,
+            )
+            if res in ("clicked", "oos"):
+                return res
+            await asyncio.sleep(0.08)
+
+        # Fallback Playwright locator click if DOM structure differed
+        loc = page.locator(f"text={target_label} >> visible=true")
+        if await loc.count() > 0:
+            try:
+                card_txt = (await loc.first.evaluate("(el) => (el.parentElement ? el.parentElement.innerText : el.innerText)")).lower()
+                if "out of stock" in card_txt:
+                    return "oos"
+                await loc.first.click(force=True, timeout=2000)
+                await loc.first.evaluate("(el) => { if(el.parentElement) el.parentElement.click(); }")
+                return "clicked"
+            except Exception:
+                pass
+        return "not_found"
+
+    async def _adjust_quantity_on_page(self, page, desired_qty: int, current_qty: int) -> int:
+        """
+        - If desired_qty == 1 and current_qty == 1: does NOTHING (0ms overhead!).
+        - If desired_qty == 2 and current_qty == 1: clicks '+' once.
+        - If desired_qty == 1 and current_qty == 2: clicks '-' once to drop back to 1 without reloading!
+        """
+        if desired_qty == current_qty:
+            return current_qty
+
+        symbol = "+" if desired_qty == 2 else "-"
+        clicked = await page.evaluate(
+            """(sym) => {
+                const all = Array.from(document.querySelectorAll('button, span, div'));
+                for (const el of all) {
+                    const txt = (el.innerText || '').trim();
+                    if ((txt === sym || (sym === '-' && txt === '−')) && el.offsetParent !== null) {
+                        el.click();
+                        if (el.parentElement) el.parentElement.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            symbol,
+        )
+        if clicked:
+            await asyncio.sleep(0.25)
+            return desired_qty
+        return current_qty
+
+    async def _verify_order_page_and_extract_codes(
+        self, page, timeout_sec: float = 16.0
+    ) -> Tuple[bool, str, List[str]]:
+        """
+        Strictly verifies that the browser has reached Rooter's Payment/Order Confirmation page
+        (matching #MO_..., 'items delivered successfully', 'Coupon Codes' -> 'Code #01')
+        and extracts the gift codes.
+        Returns: (is_verified_order, order_id, list_of_codes)
+        """
+        deadline = time.monotonic() + timeout_sec
+        order_page_reached = False
+        order_id = "Confirmed"
+        extracted_codes: List[str] = []
+
+        while time.monotonic() < deadline:
+            try:
+                data = await page.evaluate("""() => {
+                    const body = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const lower = body.toLowerCase();
+                    const url = (window.location.href || '').toLowerCase();
+
+                    // Dismiss floating promo/sale banner ('X' button on right side) so screenshot is clean
+                    const closeEls = Array.from(document.querySelectorAll('button, span, div, svg'));
+                    for (const el of closeEls) {
+                        const t = (el.innerText || '').trim();
+                        if (t === 'X' || t === '✕' || t === '×') {
+                            const r = el.getBoundingClientRect();
+                            if (r.left > 700 && r.top > 300) {
+                                try { el.click(); } catch (e) {}
+                            }
+                        }
+                    }
+
+                    const orderMatch = body.match(/#?(MO_\\d+_\\d+)/i);
+                    const hasOrderMarker = Boolean(
+                        orderMatch ||
+                        lower.includes('items delivered successfully') ||
+                        lower.includes('item purchased') ||
+                        lower.includes('coupon codes') ||
+                        url.includes('/order')
+                    );
+
+                    if (!hasOrderMarker) {
+                        return { reached: false };
+                    }
+
+                    const codes = [];
+                    const lines = body.split('\\n').map(l => l.trim()).filter(Boolean);
+
+                    // Method 1: Exact Rooter 'Code #01' / 'Code #02' next-line parser (from reference image)
+                    for (let i = 0; i < lines.length; i++) {
+                        if (/^code\\s*#?\\s*\\d+/i.test(lines[i])) {
+                            for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                                const cand = lines[j];
+                                if (
+                                    cand.length >= 8 &&
+                                    cand.length <= 32 &&
+                                    !/^(copy|redeem|write a|how to|code|coupon|product|delivery)/i.test(cand) &&
+                                    /^[A-Z0-9-]+$/i.test(cand)
+                                ) {
+                                    codes.push(cand);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 2: Standard PSN 12-digit hyphenated format (XXXX-XXXX-XXXX)
+                    const psnMatches = body.match(/\\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\\b/g) || [];
+                    for (const m of psnMatches) {
+                        codes.push(m);
+                    }
+
+                    const uniqueCodes = Array.from(new Set(codes));
+                    return {
+                        reached: true,
+                        orderId: orderMatch ? '#' + orderMatch[1].replace(/^#/, '') : 'Confirmed',
+                        codes: uniqueCodes,
+                        delivered: lower.includes('delivered successfully')
+                    };
+                }""")
+
+                if data and data.get("reached"):
+                    order_page_reached = True
+                    order_id = data.get("orderId") or order_id
+                    extracted_codes = data.get("codes") or []
+                    # As soon as codes are visible on screen, wait 0.4s for crisp render & return!
+                    if extracted_codes:
+                        await asyncio.sleep(0.4)
+                        return True, order_id, extracted_codes
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.35)
+
+        return order_page_reached, order_id, extracted_codes
+
+    # =========================================================
     # 🎯 SWARM ATTACK SNIPER BACKGROUND WORKER
     # =========================================================
+
     async def _sniper_worker(self, slot_id: str):
         account = self.get_account(slot_id)
 
@@ -1003,13 +1294,18 @@ class AccountController:
         except Exception:
             pass
 
-        log_step(slot_id, "Swarm Sniper Worker started!")
-        await self.telegram.send_message(f"🎯 Swarm Sniper ACTIVATED for {slot_id}. 30s Auto-Refresh running...")
+        log_step(slot_id, f"Swarm Sniper Worker started! (Target: Rs.{self.target_denom} x {self.target_qty})")
+        await self.telegram.send_message(
+            f"🎯 Swarm Sniper ACTIVATED for {slot_id} | Target: Rs.{self.target_denom} | Qty: {self.target_qty}"
+        )
 
         cycle_count = 0
 
         while account.logged_in:
             try:
+                target_denom = self.target_denom
+                prefed_qty = self.target_qty
+
                 cycle_count += 1
                 if cycle_count % 50 == 0:
                     try:
@@ -1019,21 +1315,28 @@ class AccountController:
                         pass
 
                 last_time = datetime.now().strftime("%I:%M:%S %p")
-                account.update(current_page=f"⏳ [STAGE: 30s Wait] (Last: {last_time})", last_error=None)
+                account.update(
+                    current_page=f"⏳ [Wait 30s | Target: Rs.{target_denom}x{prefed_qty}] ({last_time})",
+                    last_error=None,
+                )
 
                 try:
                     await asyncio.wait_for(self.stock_event.wait(), timeout=30.0)
-                    account.update(current_page="⚡ [STAGE: Swarm Triggered! Attacking!]")
+                    account.update(current_page=f"⚡ [Swarm Triggered! Attacking Rs.{target_denom}!]")
                 except asyncio.TimeoutError:
                     pass
 
                 if not account.logged_in:
                     break
 
+                # Re-read latest target_denom & target_qty in case user updated them during wait
+                target_denom = self.target_denom
+                prefed_qty = self.target_qty
+
                 page = await self.browser.get_page(slot_id)
 
                 account.update(current_page="🔄 [STAGE: Hard Refreshing Page]")
-                cache_buster = int(time.time())
+                cache_buster = int(time.time() * 1000)
                 fresh_url = (
                     f"{settings.product_url}?cb={cache_buster}"
                     if "?" not in settings.product_url
@@ -1041,174 +1344,191 @@ class AccountController:
                 )
 
                 await page.goto(fresh_url, wait_until="domcontentloaded", timeout=35000)
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(0.5)
                 await self._destroy_location_popup(page, slot_id)
 
                 content = await page.content()
                 if "Application error: a client-side exception" in content:
                     account.update(last_error="Website White Screen - Auto Retrying")
-                    await asyncio.sleep(4.0)
+                    await asyncio.sleep(2.5)
                     continue
 
-                account.update(current_page="🎯 [STAGE: Selecting Rs.5000]")
-                rs_5000_locator = page.locator("text=Rs.5000 Wallet Code >> visible=true")
+                account.update(current_page=f"🎯 [STAGE: Selecting Rs.{target_denom}]")
+                sel_result = await self._select_target_denomination(page, target_denom)
 
-                if await rs_5000_locator.count() > 0:
-                    try:
-                        await rs_5000_locator.first.click(force=True, timeout=3000)
-                        await rs_5000_locator.first.evaluate(
-                            "(el) => { if(el.parentElement) el.parentElement.click(); }"
-                        )
-                    except Exception as click_err:
-                        account.update(last_error=f"Click Note: {str(click_err)[:40]}")
-                else:
-                    fallback_loc = page.locator("text=5000 >> visible=true")
-                    if await fallback_loc.count() > 0:
-                        try:
-                            await fallback_loc.last.click(force=True, timeout=3000)
-                            await fallback_loc.last.evaluate(
-                                "(el) => { if(el.parentElement) el.parentElement.click(); }"
-                            )
-                        except Exception as click_err:
-                            account.update(last_error=f"Fallback Note: {str(click_err)[:40]}")
-                    else:
-                        account.update(last_error="Rs.5000 option not visible")
+                if sel_result == "oos":
+                    check_t = datetime.now().strftime("%I:%M:%S %p")
+                    account.update(current_page=f"😴 [Rs.{target_denom} Out of Stock] ({check_t})")
+                    await asyncio.sleep(1.0)
+                    continue
 
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(0.35)
                 await self._update_live_balance(page, account)
 
                 account.update(current_page="🔍 [STAGE: Checking for Pay Button]")
                 pay_btn_1 = page.locator("button >> text='Pay via wallet' >> visible=true").first
                 is_in_stock = False
                 try:
-                    is_in_stock = await pay_btn_1.is_visible(timeout=2500)
+                    is_in_stock = await pay_btn_1.is_visible(timeout=1800)
                 except Exception:
                     pass
 
                 if not is_in_stock:
                     check_t = datetime.now().strftime("%I:%M:%S %p")
-                    account.update(current_page=f"😴 [STAGE: Out of Stock] (Checked: {check_t})")
-                    await asyncio.sleep(1.2)
+                    account.update(current_page=f"😴 [Rs.{target_denom} Out of Stock / Low Bal] ({check_t})")
+                    await asyncio.sleep(1.0)
                     continue
 
-                log_step(slot_id, "🚨 STOCK DETECTED! Triggering Swarm Buy Flow!")
-                account.update(current_page="🚨 [STAGE: INITIATING SWARM BUY FLOW!]")
+                log_step(slot_id, f"🚨 Rs.{target_denom} STOCK DETECTED! Initiating instant buy (Pre-fed Qty: {prefed_qty})!")
+                account.update(current_page=f"🚨 [BUYING Rs.{target_denom} x {prefed_qty}!]")
 
                 if not self.stock_event.is_set():
                     self.stock_event.set()
                     asyncio.create_task(self._clear_stock_event_delayed())
 
-                await self.telegram.send_message(
-                    f"🚨 STOCK DETECTED in {slot_id}! Swarm attack initiated across all accounts..."
+                asyncio.create_task(
+                    self.telegram.send_message(
+                        f"🚨 **Rs.{target_denom} STOCK DETECTED in {slot_id}!**\n"
+                        f"⚡ Waking all accounts | Target: Rs.{target_denom} | Qty: {prefed_qty}"
+                    )
                 )
 
-                for target_qty in [2, 1]:
+                # If pre-fed Qty is 1 -> only [1] (never touches '+').
+                # If pre-fed Qty is 2 -> tries [2, 1] (tries Qty 2 first, falls back to Qty 1 on same page).
+                qty_attempts = [1] if prefed_qty == 1 else [2, 1]
+                current_page_qty = 1
+                purchase_completed = False
+
+                for attempt_qty in qty_attempts:
                     try:
-                        if target_qty == 1:
-                            account.update(current_page="🔄 [STAGE: Retrying with Qty 1]")
-                            retry_url = (
-                                f"{settings.product_url}?retry={int(time.time())}"
-                                if "?" not in settings.product_url
-                                else f"{settings.product_url}&retry={int(time.time())}"
-                            )
-                            await page.goto(retry_url, wait_until="domcontentloaded", timeout=30000)
-                            await asyncio.sleep(1.5)
+                        # If we are still on the product page, adjust quantity without reloading!
+                        if "playstation-gift-cards" not in (page.url or "").lower():
+                            await page.goto(fresh_url, wait_until="domcontentloaded", timeout=25000)
+                            await asyncio.sleep(0.5)
                             await self._destroy_location_popup(page, slot_id)
+                            await self._select_target_denomination(page, target_denom)
+                            current_page_qty = 1
 
-                            rs_5000_loc = page.locator("text=Rs.5000 Wallet Code >> visible=true")
-                            if await rs_5000_loc.count() > 0:
-                                await rs_5000_loc.first.click(force=True)
-                                await rs_5000_loc.first.evaluate(
-                                    "(el) => { if(el.parentElement) el.parentElement.click(); }"
-                                )
-                                await asyncio.sleep(1.2)
-
-                            pay_btn_1 = page.locator("button >> text='Pay via wallet' >> visible=true").first
-
-                        if target_qty == 2:
-                            account.update(current_page="➕ [STAGE: Changing Quantity to 2]")
-                            try:
-                                plus_btn = page.locator("button:has-text('+') >> visible=true").first
-                                await plus_btn.wait_for(state="visible", timeout=3000)
-                                await plus_btn.click(force=True, timeout=2000)
-                                await plus_btn.evaluate("(el) => el.click()")
-                                await asyncio.sleep(1.2)
-                            except Exception as e:
-                                account.update(last_error=f"Plus Btn Note: {str(e)[:40]}")
-
-                        account.update(current_page="💰 [STAGE: Checking Balance]")
-                        wallet_balance_text = await self._update_live_balance(page, account)
-
-                        account.update(current_page="📸 [STAGE: Taking Verification Screenshot]")
-                        screenshot_path = self.screenshots_dir / f"{slot_id}_pre_buy_qty_{target_qty}.png"
-                        try:
-                            await page.screenshot(path=str(screenshot_path), full_page=False)
-                            await self.telegram.send_photo(
-                                photo_path=str(screenshot_path),
-                                caption=(
-                                    f"🛒 SWARM BUY ATTEMPT (Qty {target_qty})!\n\n"
-                                    f"Slot: {slot_id}\nBalance Info: {wallet_balance_text}"
-                                ),
+                        if attempt_qty != current_page_qty:
+                            account.update(current_page=f"🔢 [STAGE: Setting Quantity to {attempt_qty}]")
+                            current_page_qty = await self._adjust_quantity_on_page(
+                                page, desired_qty=attempt_qty, current_qty=current_page_qty
                             )
-                            if screenshot_path.exists():
-                                screenshot_path.unlink()
+
+                        # Verify 'Pay via wallet' is visible for this quantity (checks wallet balance dynamically!)
+                        pay_btn_1 = page.locator("button >> text='Pay via wallet' >> visible=true").first
+                        can_pay_wallet = False
+                        try:
+                            can_pay_wallet = await pay_btn_1.is_visible(timeout=1500)
                         except Exception:
                             pass
 
-                        if "insufficient" in wallet_balance_text.lower() or "add money" in wallet_balance_text.lower():
-                            account.update(current_page="🛑 [STAGE: Stopped - Insufficient Funds]")
-                            await self.telegram.send_message(
-                                f"🚨 INSUFFICIENT BALANCE in {slot_id}. Buy stopped."
-                            )
-                            break
+                        if not can_pay_wallet:
+                            if attempt_qty == 2:
+                                log_step(slot_id, "Wallet insufficient for Qty 2, switching to Qty 1 immediately...")
+                                asyncio.create_task(
+                                    self.telegram.send_message(
+                                        f"⚠️ {slot_id}: Qty 2 ke liye wallet balance kam hai, turant Qty 1 buy kar raha hu!"
+                                    )
+                                )
+                                continue
+                            else:
+                                account.update(current_page="🛑 [Stopped - Insufficient Balance for Qty 1]")
+                                asyncio.create_task(
+                                    self.telegram.send_message(
+                                        f"🛑 {slot_id}: Rs.{target_denom} x 1 ke liye wallet balance kam hai."
+                                    )
+                                )
+                                break
 
-                        account.update(current_page="💳 [STAGE: Clicking First Pay Button]")
-                        await pay_btn_1.wait_for(state="visible", timeout=5000)
-                        await pay_btn_1.click(force=True, timeout=3000)
+                        # STEP 1: Click First 'Pay via wallet' immediately (NO pre-buy screenshot delay!)
+                        account.update(current_page=f"💳 [STAGE: Clicking Pay via Wallet (Qty {attempt_qty})]")
+                        await pay_btn_1.click(force=True, timeout=2500)
                         await pay_btn_1.evaluate("(el) => el.click()")
 
-                        account.update(current_page="📝 [STAGE: Waiting for Delivery Popup]")
+                        # STEP 2: Wait for 'Delivery Details' popup & click Final 'Pay via wallet'
+                        account.update(current_page="📝 [STAGE: Confirming Delivery Popup]")
                         await page.locator("text=Delivery Details >> visible=true").wait_for(
-                            state="visible", timeout=6000
+                            state="visible", timeout=5000
                         )
-                        await asyncio.sleep(1.2)
+                        await asyncio.sleep(0.25)
 
-                        account.update(current_page="💳 [STAGE: Clicking Final Pay Button]")
+                        account.update(current_page="💳 [STAGE: Clicking Final Pay via Wallet]")
                         pay_btn_2 = page.locator("button >> text='Pay via wallet' >> visible=true").last
-                        await pay_btn_2.wait_for(state="visible", timeout=5000)
-                        await pay_btn_2.click(force=True, timeout=3000)
+                        await pay_btn_2.wait_for(state="visible", timeout=4000)
+                        await pay_btn_2.click(force=True, timeout=2500)
                         await pay_btn_2.evaluate("(el) => el.click()")
 
-                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        account.update(current_page="✅ [STAGE: SUCCESS - Code Bought!]")
-                        log_step(slot_id, f"✅ CODE PURCHASED! Qty: {target_qty}")
-                        await self.telegram.send_message(
-                            f"✅✅ SWARM SUCCESS: CODE PURCHASED!\n"
-                            f"Amount: Rs.5000\nQty: {target_qty}\nSlot: {slot_id}\nTime: {current_time}"
+                        # STEP 3: STRICT ORDER PAGE & CODE VERIFICATION (No fake success messages!)
+                        account.update(current_page="⏳ [STAGE: Verifying Payment Page & Extracting Code...]")
+                        verified, order_id, codes = await self._verify_order_page_and_extract_codes(
+                            page, timeout_sec=16.0
                         )
+
+                        if not verified:
+                            log_step(slot_id, f"Payment page not reached on Qty {attempt_qty}, retrying without fake success...")
+                            account.update(last_error=f"Order page not reached (Qty {attempt_qty}), retrying...")
+                            continue
+
+                        # VERIFIED ON PAYMENT / ORDER PAGE! Take 1 clean screenshot & send everything in 1 message!
+                        purchase_completed = True
+                        current_time = datetime.now().strftime("%I:%M:%S %p, %d %b %Y")
+                        account.update(
+                            current_page=f"✅ [BOUGHT Rs.{target_denom}x{attempt_qty} | {order_id}]",
+                            last_error=None,
+                        )
+                        log_step(slot_id, f"✅ VERIFIED ORDER {order_id} | Codes: {codes}")
+
+                        if codes:
+                            codes_text = "\n".join(
+                                f"🎟 **Code #{idx:02d}:** `{code}`"
+                                for idx, code in enumerate(codes, start=1)
+                            )
+                        else:
+                            codes_text = "🎟 **Code:** Screenshot mein `Coupon Codes` ke niche dekho भाई!"
+
+                        success_caption = (
+                            f"✅✅ **SWARM SUCCESS: CODE PURCHASED!**\n\n"
+                            f"🆔 **Order ID:** `{order_id}`\n"
+                            f"🎮 **Product:** Rs.{target_denom} Wallet Code\n"
+                            f"📦 **Quantity:** {attempt_qty}\n"
+                            f"👤 **Slot:** {slot_id} ({account.phone_number or 'Active'})\n"
+                            f"{codes_text}\n"
+                            f"🕒 **Time:** {current_time}"
+                        )
+
+                        shot_path = self.screenshots_dir / f"{slot_id}_order_success_{int(time.time())}.png"
+                        try:
+                            await page.screenshot(path=str(shot_path), full_page=False)
+                            await self.telegram.send_photo(
+                                photo_path=str(shot_path),
+                                caption=success_caption,
+                            )
+                        except Exception as ss_err:
+                            log_step(slot_id, f"Photo send fallback note: {ss_err}")
+                            await self.telegram.send_message(success_caption)
+                        finally:
+                            if shot_path.exists():
+                                try:
+                                    shot_path.unlink()
+                                except Exception:
+                                    pass
+
+                        await self.browser.save_session(slot_id, account.phone_number)
                         break
 
                     except Exception as flow_err:
-                        account.update(last_error=f"Buy Flow Qty {target_qty} Error: {str(flow_err)[:50]}")
-                        error_ss = self.screenshots_dir / f"{slot_id}_error_qty_{target_qty}.png"
-                        try:
-                            await page.screenshot(path=str(error_ss), full_page=False)
-                            await self.telegram.send_photo(
-                                photo_path=str(error_ss),
-                                caption=f"⚠️ Failed Qty {target_qty} for {slot_id}",
-                            )
-                            if error_ss.exists():
-                                error_ss.unlink()
-                        except Exception:
-                            pass
+                        log_step(slot_id, f"Attempt Qty {attempt_qty} note: {flow_err}")
+                        account.update(last_error=f"Retry Note (Qty {attempt_qty}): {str(flow_err)[:40]}")
+                        # No fake success message—quietly continue to next attempt or next loop retry!
+                        continue
 
-                        if target_qty == 2:
-                            await self.telegram.send_message(f"🔄 {slot_id} retrying with Quantity 1...")
-                        else:
-                            account.update(current_page="❌ [STAGE: Buy Flow Failed Completely]")
-                            await self.telegram.send_message(f"❌ {slot_id} failed completely.")
-
-                await asyncio.sleep(5.0)
+                if purchase_completed:
+                    # Wait briefly after a successful purchase before returning to product page monitoring
+                    await asyncio.sleep(8.0)
+                else:
+                    # Fast retry if stuck or not bought yet
+                    await asyncio.sleep(1.5)
 
             except asyncio.CancelledError:
                 account.update(current_page="⏸️ Sniper Paused")
@@ -1224,7 +1544,7 @@ class AccountController:
                     await self.browser.reset_slot_page(slot_id)
                 except Exception:
                     pass
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.5)
 
         self.sniper_tasks.pop(slot_id, None)
 
@@ -1243,7 +1563,10 @@ class AccountController:
 
             if target == "all":
                 started = self._ensure_snipers_running()
-                await update.message.reply_text(f"🔫 Swarm Sniper active/started! ({started} newly launched)")
+                await update.message.reply_text(
+                    f"🔫 Swarm Sniper active/started! ({started} newly launched)\n"
+                    f"🎯 Target: Rs.{self.target_denom} Wallet Code | Qty: {self.target_qty}"
+                )
             else:
                 slot_id = target.upper()
                 acc = self.get_account(slot_id)
@@ -1252,7 +1575,9 @@ class AccountController:
                 task = self.sniper_tasks.get(slot_id)
                 if task is None or task.done():
                     self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
-                    await update.message.reply_text(f"🔫 Sniper started for {slot_id}")
+                    await update.message.reply_text(
+                        f"🔫 Sniper started for {slot_id} (Target: Rs.{self.target_denom} x {self.target_qty})"
+                    )
                 else:
                     await update.message.reply_text(f"✅ Sniper is already running on {slot_id}")
         except Exception as exc:
@@ -1288,5 +1613,7 @@ class AccountController:
         self.stock_event.clear()
 
     async def handle_trigger_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🚨 SWARM TRIGGER SENT! Waking up ALL accounts to attack stock NOW!")
+        await update.message.reply_text(
+            f"🚨 SWARM TRIGGER SENT! Waking up ALL accounts to attack **Rs.{self.target_denom} x {self.target_qty}** NOW!"
+        )
         await self.trigger_stock_buy()
