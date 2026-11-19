@@ -1,9 +1,10 @@
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from telegram import Update
+from telegram import InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -22,6 +23,9 @@ class TelegramBot:
     def __init__(self):
         self.application: Optional[Application] = None
         self.callbacks: dict[str, CommandCallback] = {}
+        self.callback_query_handler: Optional[CommandCallback] = None
+        self.text_input_handler: Optional[CommandCallback] = None
+        self.document_input_handler: Optional[CommandCallback] = None
 
     def register_command(
         self,
@@ -29,7 +33,6 @@ class TelegramBot:
         callback: CommandCallback,
     ):
         self.callbacks[command] = callback
-        # Agar application pehle se build ho chuki hai toh dynamically add kar do
         if self.application is not None:
             self.application.add_handler(
                 CommandHandler(
@@ -38,6 +41,27 @@ class TelegramBot:
                     block=False,
                 )
             )
+
+    def register_callback_query(self, callback: CommandCallback):
+        self.callback_query_handler = callback
+        if self.application is not None:
+            self.application.add_handler(
+                CallbackQueryHandler(self._handle_callback_query, block=False)
+            )
+
+    def register_text_handler(self, callback: CommandCallback):
+        self.text_input_handler = callback
+        if self.application is not None:
+            self.application.add_handler(
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    self._handle_text_input,
+                    block=False,
+                )
+            )
+
+    def register_document_handler(self, callback: CommandCallback):
+        self.document_input_handler = callback
 
     def _create_handler(self, command: str):
         async def handler(
@@ -51,12 +75,33 @@ class TelegramBot:
 
         return handler
 
+    async def _handle_callback_query(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if self.callback_query_handler is not None:
+            await self.callback_query_handler(update, context)
+
+    async def _handle_text_input(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if self.text_input_handler is not None:
+            await self.text_input_handler(update, context)
+
     async def _document_handler(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ):
-        """Agar user .json cookie file caption '/cookie S1-A1' ke sath bheje toh handle karega."""
+        """Handles both interactive wizard .json uploads AND '/cookie S1-A1' captioned files."""
+        if self.document_input_handler is not None:
+            handled = await self.document_input_handler(update, context)
+            if handled:
+                return
+
         if not update.message or not update.message.caption:
             return
         caption = update.message.caption.strip()
@@ -78,10 +123,14 @@ class TelegramBot:
             .build()
         )
 
-        # Saare commands jo controller.py mein hain + jo dynamic register honge
         default_commands = [
             "start",
             "status",
+            "denom",
+            "target",
+            "code",
+            "qty",
+            "abort",
             "login",
             "otp",
             "cookie",
@@ -107,11 +156,28 @@ class TelegramBot:
                 )
             )
 
+        # Inline button callback handler for interactive /start wizard
+        self.application.add_handler(
+            CallbackQueryHandler(
+                self._handle_callback_query,
+                block=False,
+            )
+        )
+
         # Document (.json cookie file) handler
         self.application.add_handler(
             MessageHandler(
                 filters.Document.ALL,
                 self._document_handler,
+                block=False,
+            )
+        )
+
+        # Plain text handler for interactive wizard inputs (phone / OTP / token)
+        self.application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._handle_text_input,
                 block=False,
             )
         )
@@ -122,6 +188,8 @@ class TelegramBot:
         self,
         text: str,
         chat_id: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ):
         if self.application is None:
             raise RuntimeError("Telegram application is not built")
@@ -130,16 +198,29 @@ class TelegramBot:
         if not target_chat:
             raise RuntimeError("TELEGRAM_CHAT_ID is not configured")
 
-        await self.application.bot.send_message(
-            chat_id=target_chat,
-            text=text,
-        )
+        try:
+            return await self.application.bot.send_message(
+                chat_id=target_chat,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            if parse_mode is not None:
+                return await self.application.bot.send_message(
+                    chat_id=target_chat,
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+            raise
 
     async def send_photo(
         self,
         photo_path: str,
         caption: Optional[str] = None,
         chat_id: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ):
         if self.application is None:
             raise RuntimeError("Telegram application is not built")
@@ -152,12 +233,27 @@ class TelegramBot:
         if not path.exists():
             raise FileNotFoundError(f"Screenshot not found: {photo_path}")
 
-        with path.open("rb") as photo:
-            await self.application.bot.send_photo(
-                chat_id=target_chat,
-                photo=photo,
-                caption=caption,
-            )
+        safe_caption = caption[:1020] if caption else None
+
+        try:
+            with path.open("rb") as photo:
+                return await self.application.bot.send_photo(
+                    chat_id=target_chat,
+                    photo=photo,
+                    caption=safe_caption,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+        except Exception:
+            if parse_mode is not None:
+                with path.open("rb") as photo:
+                    return await self.application.bot.send_photo(
+                        chat_id=target_chat,
+                        photo=photo,
+                        caption=safe_caption,
+                        reply_markup=reply_markup,
+                    )
+            raise
 
     async def start(self):
         if self.application is None:
