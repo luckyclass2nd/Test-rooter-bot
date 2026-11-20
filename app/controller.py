@@ -50,6 +50,8 @@ class AccountController:
 
     VALID_DENOMS = ("1000", "2000", "3000", "4000", "5000")
     VALID_ABORT_PCTS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
+    MONITOR_SLOT_ID = "MONITOR"
+    MONITOR_INTERVAL_SEC = 10.0
 
     def __init__(
         self,
@@ -71,7 +73,18 @@ class AccountController:
         self.abort_limit_pct: Optional[int] = None  # None = OFF, or 5..50
         self._load_target_config()
 
+        # Dedicated 10-Second Monitor Slot State
+        self.monitor_task: Optional[asyncio.Task] = None
+        self.monitor_last_check: str = "Starting..."
+        self.monitor_state: str = "🟡 Booting 10s Monitor..."
+        self.monitor_stock_map: Dict[str, bool] = {d: False for d in self.VALID_DENOMS}
+        self._monitor_was_target_in_stock: bool = False
+        self._last_stock_alert_ts: float = 0.0
+
+        # Swarm Wake-Up Broadcast Event + Drop Tracking (Zero Duplicate Buys per Drop)
         self.stock_event = asyncio.Event()
+        self.current_drop_id: int = 0
+        self.slot_bought_drop: Dict[str, int] = {}
         self.sniper_tasks: Dict[str, asyncio.Task] = {}
 
         # Interactive /start wizard state per chat_id
@@ -81,10 +94,24 @@ class AccountController:
         self._last_abort_alert: Dict[str, float] = {}
 
         self._create_slots()
+        self._schedule_boot_workers()
         log_step(
             "SYSTEM",
             f"Controller initialized | Target: Rs.{self.target_denom} | Qty: {self.target_qty} | Abort: {self._abort_label()}",
         )
+
+    def _schedule_boot_workers(self):
+        """Auto-starts the 10s light Monitor and warms restored accounts on Railway boot."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._boot_sequence())
+        except RuntimeError:
+            pass
+
+    async def _boot_sequence(self):
+        await asyncio.sleep(2.0)
+        self._ensure_monitor_running()
+        self._ensure_snipers_running()
 
     # =========================================================
     # PERSISTENT CONFIG (DENOM, QTY, ABORT LIMIT)
@@ -147,14 +174,19 @@ class AccountController:
                     state.logged_in = True
                     state.active = True
                     state.phone_number = saved_phone or "Saved Session"
-                    state.current_page = "✅ Session Restored (Auto-Starting...)"
+                    state.current_page = "✅ Session Restored (Warming...)"
                     log_step(slot_id, f"Restored saved session (ID: {state.phone_number})")
             except Exception as e:
                 log_step(slot_id, f"Session restore note: {e}")
 
             self.accounts[slot_id] = state
 
+    def _ensure_monitor_running(self):
+        if self.monitor_task is None or self.monitor_task.done():
+            self.monitor_task = asyncio.create_task(self._monitor_worker())
+
     def _ensure_snipers_running(self) -> int:
+        self._ensure_monitor_running()
         started = 0
         for slot_id, acc in self.accounts.items():
             if acc.logged_in:
@@ -198,7 +230,6 @@ class AccountController:
         self.telegram.register_command("trigger_buy", self.handle_trigger_buy)
         self.telegram.register_command("heal", self.handle_heal)
 
-        # Smart Interactive Button Wizard + Direct Input Handlers
         self.telegram.register_callback_query(self.handle_callback_query)
         self.telegram.register_text_handler(self.handle_wizard_text)
         self.telegram.register_document_handler(self.handle_wizard_document)
@@ -221,15 +252,19 @@ class AccountController:
         else:
             abort_str = "OFF (No Price Cap)"
 
+        mon_running = self.monitor_task is not None and not self.monitor_task.done()
+        mon_badge = f"🟢 ON (Last: {self.monitor_last_check})" if mon_running else "🔴 OFF"
+
         text = (
             "🤖 <b>ROOTER SWARM ULTRA PRO</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👀 <b>10s Monitor:</b> <code>{esc(mon_badge)}</code>\n"
             f"🎯 <b>Target Code:</b> <code>Rs.{esc(self.target_denom)} Wallet Code</code>\n"
             f"📦 <b>Quantity:</b> <code>{self.target_qty}</code> "
             f"({'Direct Fast Buy' if self.target_qty == 1 else 'Double → 1 Fallback'})\n"
             f"🛡️ <b>Abort Limit:</b> <code>{esc(abort_str)}</code>\n"
-            f"🔐 <b>Accounts:</b> <code>{logged_in}/{settings.total_slots}</code> | "
-            f"🔫 <b>Snipers:</b> <code>{snipers_on}/{settings.total_slots}</code>\n"
+            f"🔐 <b>Quiet Ready Accounts:</b> <code>{logged_in}/{settings.total_slots}</code> | "
+            f"🔫 <b>Armed:</b> <code>{snipers_on}/{settings.total_slots}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "👇 Niche se category choose karo:"
         )
@@ -260,8 +295,22 @@ class AccountController:
         )
         return text, keyboard
 
-    def _slot_picker_keyboard(self, action_prefix: str, back_target: str = "m:home") -> InlineKeyboardMarkup:
+    def _slot_picker_keyboard(
+        self,
+        action_prefix: str,
+        back_target: str = "m:home",
+        include_monitor: bool = False,
+    ) -> InlineKeyboardMarkup:
         rows: List[List[InlineKeyboardButton]] = []
+        if include_monitor:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "👀 MONITOR (10s Light Tab)",
+                        callback_data=f"{action_prefix}:{self.MONITOR_SLOT_ID}",
+                    )
+                ]
+            )
         row: List[InlineKeyboardButton] = []
         for acc in self.all_accounts():
             icon = "✅" if acc.logged_in else "⚪"
@@ -367,19 +416,20 @@ class AccountController:
     def _sniper_menu_view(self) -> Tuple[str, InlineKeyboardMarkup]:
         text = (
             "🔫 <b>SNIPER & POPUP CONTROL</b>\n\n"
-            "Sabhi accounts ko ek sath Start/Stop karo ya kisi ek slot ko toggle karo:"
+            "• 10s Monitor tab har 10s mein stock check karta hai.\n"
+            "• Armed accounts shant standby mein rehte hain aur stock aate hi 1ms mein ek sath attack karte hain:"
         )
         rows: List[List[InlineKeyboardButton]] = [
             [
-                InlineKeyboardButton("▶️ Start All", callback_data="m:sniper_all_on"),
-                InlineKeyboardButton("⏸️ Stop All", callback_data="m:sniper_all_off"),
+                InlineKeyboardButton("▶️ Arm All", callback_data="m:sniper_all_on"),
+                InlineKeyboardButton("⏸️ Disarm All", callback_data="m:sniper_all_off"),
             ]
         ]
         slot_row: List[InlineKeyboardButton] = []
         for acc in self.all_accounts():
             t = self.sniper_tasks.get(acc.slot_id)
             running = bool(t and not t.done())
-            badge = "🟢 ON" if running else ("⏸️ OFF" if acc.logged_in else "⚪")
+            badge = "🟢 ARMED" if running else ("⏸️ OFF" if acc.logged_in else "⚪")
             slot_row.append(
                 InlineKeyboardButton(
                     f"{acc.slot_id} {badge}",
@@ -398,10 +448,16 @@ class AccountController:
 
     def _build_status_html(self) -> str:
         qty_desc = "1 (Direct Fast Buy)" if self.target_qty == 1 else "2 (Auto Fallback → 1)"
+        stock_lines = " | ".join(
+            f"{'✅' if self.monitor_stock_map.get(d) else '❌'}{d}"
+            for d in self.VALID_DENOMS
+        )
         lines = [
-            "📊 <b>SWARM ACCOUNT STATUS</b>",
-            f"🎯 <b>Target:</b> <code>Rs.{esc(self.target_denom)} Wallet Code</code>",
-            f"📦 <b>Qty:</b> <code>{esc(qty_desc)}</code>",
+            "📊 <b>SWARM LIVE STATUS</b>",
+            f"👀 <b>10s Monitor:</b> {esc(self.monitor_state)}",
+            f"🕒 <b>Last 10s Check:</b> <code>{esc(self.monitor_last_check)}</code>",
+            f"🎮 <b>Live Stock:</b> {stock_lines}",
+            f"🎯 <b>Target:</b> <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> ({esc(qty_desc)})",
             f"🛡️ <b>Abort Limit:</b> <code>{esc(self._abort_label())}</code>",
             "",
         ]
@@ -409,7 +465,7 @@ class AccountController:
             phone = account.phone_number if account.phone_number else "Saved Session"
             login_state = "✅ LOGGED IN" if account.logged_in else "❌ EMPTY"
             task = self.sniper_tasks.get(account.slot_id)
-            sniper_state = "🔫 ON" if (task and not task.done()) else "⏸️ OFF"
+            sniper_state = "🔫 ARMED" if (task and not task.done()) else "⏸️ OFF"
             balance = f"₹{account.wallet_balance:,.2f}" if account.wallet_balance is not None else "-"
 
             lines.append(f"🆔 <b>{esc(account.slot_id)}</b> | {login_state} | {sniper_state}")
@@ -559,7 +615,7 @@ class AccountController:
             return await self._safe_edit(
                 query,
                 "🖥 <b>LIVE SCREENSHOT</b>\n\nKis slot ki screen dekhni hai?",
-                self._slot_picker_keyboard("m:do_screen", back_target="m:home"),
+                self._slot_picker_keyboard("m:do_screen", back_target="m:home", include_monitor=True),
             )
 
         if data.startswith("m:do_screen:"):
@@ -615,6 +671,7 @@ class AccountController:
             denom = data.split(":")[-1].strip()
             if denom in self.VALID_DENOMS:
                 self.target_denom = denom
+                self._monitor_was_target_in_stock = False
                 self._save_target_config()
                 self._ensure_snipers_running()
             text, kb = self._target_menu_view()
@@ -690,7 +747,7 @@ class AccountController:
             await self._safe_edit(
                 query,
                 f"🚨 <b>SWARM TRIGGER SENT!</b>\n"
-                f"Saare accounts abhi <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> "
+                f"Saare accounts abhi parallel refresh karke <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> "
                 f"(Abort: <code>{esc(self._abort_label())}</code>) par attack kar rahe hain!",
                 kb,
             )
@@ -698,12 +755,12 @@ class AccountController:
             return
 
         if data == "m:heal":
-            await self._safe_edit(query, "🧹 Healing browser & cleaning RAM for all active slots...")
+            await self._safe_edit(query, "🧹 Healing 10s Monitor + all active slots & cleaning RAM...")
             healed = await self._heal_all_core()
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="m:home")]])
             return await self._safe_edit(
                 query,
-                f"✅ RAM cleaned & <b>{healed}</b> slots refreshed! Saare snipers active hain.",
+                f"✅ RAM cleaned, 10s Monitor reset & <b>{healed}</b> slots re-warmed!",
                 kb,
             )
 
@@ -724,7 +781,6 @@ class AccountController:
         prompt_msg_id = state.get("prompt_msg_id")
         user_text = update.message.text.strip()
 
-        # Remove old prompt message to keep chat super clean
         if prompt_msg_id:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
@@ -871,7 +927,7 @@ class AccountController:
         return True
 
     # =========================================================
-    # SLASH COMMANDS (STILL 100% SUPPORTED)
+    # SLASH COMMANDS (100% SUPPORTED AS SHORTCUTS)
     # =========================================================
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -885,14 +941,10 @@ class AccountController:
         await update.message.reply_text(
             "📖 <b>ROOTER SWARM ULTRA PRO</b>\n\n"
             "✨ <b>Easy Mode:</b> Bas <code>/start</code> bhejo—saare options buttons se mil jayenge!\n\n"
-            "⌨️ <b>Direct Shortcut Commands:</b>\n"
-            "• <code>/denom 2000</code> — Target code (1000..5000)\n"
-            "• <code>/qty 1</code> ya <code>/qty 2</code> — Quantity pre-feed\n"
-            "• <code>/abort 15</code> ya <code>/abort off</code> — Max price surge limit (5%..50%)\n"
-            "• <code>/status</code> — Live accounts & settings\n"
-            "• <code>/trigger_buy</code> — Wake all accounts NOW\n"
-            "• <code>/screen S1-A1</code> — Live screenshot\n"
-            "• <code>/heal</code> — Reset RAM & tabs",
+            "👀 <b>Architecture:</b> 1 Light Monitor Tab har 10s mein refresh karta hai, "
+            "aur logged-in accounts shant standby mein reh kar stock aate hi 1ms mein parallel attack karte hain!\n\n"
+            "⌨️ <b>Shortcuts:</b> <code>/denom 3000</code> | <code>/qty 1</code> | <code>/abort 20</code> | "
+            "<code>/status</code> | <code>/screen monitor</code> | <code>/trigger_buy</code>",
             parse_mode="HTML",
         )
 
@@ -921,6 +973,7 @@ class AccountController:
             )
 
         self.target_denom = raw_val
+        self._monitor_was_target_in_stock = False
         self._save_target_config()
         self._ensure_snipers_running()
         await update.message.reply_text(
@@ -955,7 +1008,7 @@ class AccountController:
             self.abort_limit_pct = int(raw)
         else:
             return await update.message.reply_text(
-                "❌ 5% se 50% (5 ke multiple) ya <code>off</code> bhejo! Example: <code>/abort 15</code>",
+                "❌ 5% se 50% (5 ke multiple) ya <code>off</code> bhejo! Example: <code>/abort 20</code>",
                 parse_mode="HTML",
             )
 
@@ -967,21 +1020,35 @@ class AccountController:
         )
 
     async def handle_heal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🧹 Healing browser & cleaning RAM for all active slots...")
+        await update.message.reply_text("🧹 Healing 10s Monitor + all active slots & cleaning RAM...")
         healed = await self._heal_all_core()
         await update.message.reply_text(
-            f"✅ RAM cleaned & <b>{healed}</b> slots refreshed! All snipers running.",
+            f"✅ RAM cleaned, 10s Monitor reset & <b>{healed}</b> slots refreshed!",
             parse_mode="HTML",
         )
 
     async def _heal_all_core(self) -> int:
+        self.slot_bought_drop.clear()
+        self._last_abort_alert.clear()
+        self._monitor_was_target_in_stock = False
+        try:
+            await self.browser.reset_slot_page(self.MONITOR_SLOT_ID)
+        except Exception:
+            pass
+
         healed = 0
         for slot_id, acc in self.accounts.items():
             if acc.logged_in:
                 try:
                     await self.browser.save_session(slot_id, acc.phone_number)
                     await self.browser.reset_slot_page(slot_id)
-                    acc.update(current_page="✨ Healed & Fresh", last_error=None)
+                    page = await self.browser.open_product_page(slot_id)
+                    await self._destroy_location_popup(page, slot_id)
+                    await self._update_live_balance(page, acc)
+                    acc.update(
+                        current_page=f"🟢 Warm & Quiet (Standby | Rs.{self.target_denom}x{self.target_qty})",
+                        last_error=None,
+                    )
                     healed += 1
                 except Exception:
                     pass
@@ -1136,15 +1203,17 @@ class AccountController:
             balance_txt = await self._update_live_balance(page, account)
             await self.browser.save_session(slot_id, user_label)
 
+            self.slot_bought_drop.pop(slot_id, None)
             account.update(
                 phone_number=user_label,
                 logged_in=True,
                 active=True,
-                current_page="✅ Token Active & Verified",
+                current_page=f"🟢 Warm & Quiet (Standby | Rs.{self.target_denom}x{self.target_qty})",
                 last_error=None,
             )
             log_step(slot_id, f"Cookie session live-loaded ({user_label}) | {balance_txt}")
 
+            self._ensure_monitor_running()
             self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
 
             return True, (
@@ -1153,7 +1222,7 @@ class AccountController:
                 f"📱 Device: <code>{esc(extracted_device_id[:12])}...</code>\n"
                 f"💰 Wallet: <code>{esc(balance_txt)}</code>\n"
                 f"🎯 Target: <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code>\n"
-                "🔫 Swarm Sniper Auto-Started!"
+                "🟢 Tab pre-warmed & shant standby mein hai — stock aate hi 1ms mein attack karega!"
             )
         except Exception as exc:
             log_step("COOKIE_ERR", f"Failed: {exc}")
@@ -1195,7 +1264,8 @@ class AccountController:
             if not page.url or page.url == "about:blank":
                 return False, f"❌ <b>{esc(slot_id)}</b> ka browser page active nahi hai."
             await self._destroy_location_popup(page, slot_id)
-            await self.browser.save_session(slot_id, self.get_account(slot_id).phone_number)
+            if slot_id != self.MONITOR_SLOT_ID:
+                await self.browser.save_session(slot_id, self.get_account(slot_id).phone_number)
             return True, f"✅ Location popup dismissed & Indian region locked for <b>{esc(slot_id)}</b>!"
         except Exception as exc:
             return False, f"❌ Force popup failed: <code>{esc(exc)}</code>"
@@ -1209,6 +1279,41 @@ class AccountController:
     async def _screen_slot_core(self, slot_id: str, chat_id: Optional[str] = None) -> Tuple[bool, str]:
         try:
             slot_id = slot_id.upper()
+            kb = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🖥 Another Screen", callback_data="m:screen")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="m:home")],
+                ]
+            )
+
+            if slot_id == self.MONITOR_SLOT_ID:
+                self._ensure_monitor_running()
+                page = await self.browser.get_page(self.MONITOR_SLOT_ID)
+                if not page.url or page.url == "about:blank":
+                    await page.goto(settings.product_url, wait_until="domcontentloaded", timeout=25000)
+                await self._destroy_location_popup(page, self.MONITOR_SLOT_ID)
+                shot_path = self.screenshots_dir / f"MONITOR_{int(time.time())}.png"
+                await page.screenshot(path=str(shot_path), full_page=False)
+                stock_summary = " | ".join(
+                    f"{'✅' if self.monitor_stock_map.get(d) else '❌'}{d}"
+                    for d in self.VALID_DENOMS
+                )
+                await self.telegram.send_photo(
+                    photo_path=str(shot_path),
+                    caption=(
+                        f"👀 <b>10s LIGHT MONITOR TAB</b>\n"
+                        f"🕒 <b>Last Check:</b> <code>{esc(self.monitor_last_check)}</code>\n"
+                        f"🎮 <b>Live Stock:</b> {stock_summary}\n"
+                        f"📍 <b>State:</b> {esc(self.monitor_state)}"
+                    ),
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+                if shot_path.exists():
+                    shot_path.unlink()
+                return True, "✅ Monitor screenshot sent!"
+
             account = self.get_account(slot_id)
             page = await self.browser.get_page(slot_id)
             if not page.url or page.url == "about:blank":
@@ -1218,12 +1323,6 @@ class AccountController:
             await self._destroy_location_popup(page, slot_id)
             screenshot_path = self.screenshots_dir / f"{slot_id}_{int(time.time())}.png"
             await page.screenshot(path=str(screenshot_path), full_page=False)
-            kb = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🖥 Another Screen", callback_data="m:screen")],
-                    [InlineKeyboardButton("🏠 Main Menu", callback_data="m:home")],
-                ]
-            )
             await self.telegram.send_photo(
                 photo_path=str(screenshot_path),
                 caption=(
@@ -1240,14 +1339,15 @@ class AccountController:
             return True, "✅ Screenshot sent!"
         except Exception as exc:
             try:
-                self.get_account(slot_id).update(last_error=str(exc))
+                if slot_id != self.MONITOR_SLOT_ID:
+                    self.get_account(slot_id).update(last_error=str(exc))
             except Exception:
                 pass
             return False, f"❌ Screenshot failed ({esc(slot_id)}): <code>{esc(exc)}</code>"
 
     async def handle_screen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
-            return await update.message.reply_text("❌ Format: <code>/screen S1-A1</code>", parse_mode="HTML")
+            return await update.message.reply_text("❌ Format: <code>/screen S1-A1</code> ya <code>/screen monitor</code>", parse_mode="HTML")
         ok, res_html = await self._screen_slot_core(context.args[0].upper(), str(update.message.chat_id))
         if not ok:
             await update.message.reply_text(res_html, parse_mode="HTML")
@@ -1257,24 +1357,31 @@ class AccountController:
             slot_id = slot_id.upper()
             account = self.get_account(slot_id)
             page = await self.browser.reset_slot_page(slot_id)
-            cb = int(time.time())
+            cb = int(time.time() * 1000)
             fresh_url = (
                 f"{settings.product_url}?cb={cb}"
                 if "?" not in settings.product_url
                 else f"{settings.product_url}&cb={cb}"
             )
-            await page.goto(fresh_url, wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(1.0)
+            await page.goto(fresh_url, wait_until="domcontentloaded", timeout=35000)
+            await asyncio.sleep(0.8)
             await self._destroy_location_popup(page, slot_id)
+            await self._update_live_balance(page, account)
             await self.browser.save_session(slot_id, account.phone_number)
 
-            account.update(logged_in=True, active=True, current_page="🔄 Manually Refreshed", last_error=None)
+            account.update(
+                logged_in=True,
+                active=True,
+                current_page=f"🟢 Warm & Quiet (Refreshed | Rs.{self.target_denom}x{self.target_qty})",
+                last_error=None,
+            )
+            self._ensure_monitor_running()
             task = self.sniper_tasks.get(slot_id)
             if task is None or task.done():
                 self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
             return True, (
                 f"🔄 Hard Refreshed <b>{esc(slot_id)}</b>!\n"
-                f"🎯 Target: <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> | 🔫 Sniper Active!"
+                f"🎯 Target: <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> | 🟢 Quiet Standby Armed!"
             )
         except Exception as exc:
             try:
@@ -1298,6 +1405,7 @@ class AccountController:
             if task and not task.done():
                 task.cancel()
 
+            self.slot_bought_drop.pop(slot_id, None)
             await self.browser.close_slot(slot_id)
             self.browser.sessions.delete_session(slot_id)
 
@@ -1367,7 +1475,7 @@ class AccountController:
             ):
                 log_step(slot_id, f"Redirected to {curr_url}! Returning to PlayStation product page...")
                 await page.goto(settings.product_url, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.7)
                 await self.browser.handle_location_popup(page, slot_id)
         except Exception as e:
             log_step(slot_id, f"URL check note: {e}")
@@ -1751,9 +1859,16 @@ class AccountController:
             balance_txt = await self._update_live_balance(page, account)
             await self.browser.save_session(slot_id, account.phone_number)
 
-            account.update(logged_in=True, active=True, current_page="✅ Logged In & Saved", last_error=None)
+            self.slot_bought_drop.pop(slot_id, None)
+            account.update(
+                logged_in=True,
+                active=True,
+                current_page=f"🟢 Warm & Quiet (Standby | Rs.{self.target_denom}x{self.target_qty})",
+                last_error=None,
+            )
             log_step(slot_id, f"Login successful & saved! ({balance_txt})")
 
+            self._ensure_monitor_running()
             task = self.sniper_tasks.get(slot_id)
             if task is None or task.done():
                 self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
@@ -1763,7 +1878,7 @@ class AccountController:
                 f"📱 Phone: <code>{esc(account.phone_number)}</code>\n"
                 f"💰 Wallet: <code>{esc(balance_txt)}</code>\n"
                 f"🎯 Target: <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code>\n"
-                "🔫 Sniper AUTO-STARTED!"
+                "🟢 Account shant standby mein hai — 10s Monitor stock detect karte hi attack karega!"
             )
         except Exception as exc:
             log_step(slot_id, f"OTP failed: {exc}")
@@ -1789,133 +1904,312 @@ class AccountController:
         await update.message.reply_text(res_html, parse_mode="HTML")
 
     # =========================================================
-    # 🎯 EXACT CARD SELECTOR, VERIFIED QUANTITY & MILLISECOND ABORT ENGINE
+    # 👀 10-SECOND DEDICATED LIGHTWEIGHT MONITOR SLOT
+    # =========================================================
+
+    async def _scan_all_denoms_on_page(self, page) -> Tuple[bool, Dict[str, bool]]:
+        """
+        Single-pass ultra-fast DOM scan on the unlogged MONITOR tab.
+        Reads all 5 cards (Rs.1000..Rs.5000) accurately without clicking anything.
+        """
+        res = await page.evaluate(r"""() => {
+            const bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+            const hydrated = bodyTxt.includes('rs.5000 wallet code') && (bodyTxt.includes('out of stock') || bodyTxt.includes('₹'));
+            if (!hydrated) {
+                return { hydrated: false, stock: {} };
+            }
+
+            const denoms = ['1000', '2000', '3000', '4000', '5000'];
+            const stock = {};
+            const allEls = Array.from(document.querySelectorAll('div, button, span, p'));
+
+            for (const d of denoms) {
+                stock[d] = false;
+                const label = `rs.${d} wallet code`;
+                let labelEl = null;
+
+                for (const el of allEls) {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    if ((t === label || t.startsWith(label + '\n')) && t.length < 95 && el.offsetParent !== null) {
+                        labelEl = el;
+                        break;
+                    }
+                }
+                if (!labelEl) continue;
+
+                // Climb up to single card container (never crosses into sibling denomination cards)
+                let card = labelEl;
+                let cur = labelEl;
+                for (let depth = 0; depth < 6 && cur && cur.parentElement; depth++) {
+                    const pt = (cur.parentElement.innerText || '').toLowerCase();
+                    const matches = pt.match(/rs\.\d{4}\s*wallet code/g) || [];
+                    if (matches.length > 1) break;
+                    cur = cur.parentElement;
+                    if (pt.includes('out of stock') || pt.includes('₹')) {
+                        card = cur;
+                    }
+                }
+
+                const cardTxt = (card.innerText || '').toLowerCase();
+                const isOos = cardTxt.includes('out of stock');
+                const hasPrice = cardTxt.includes('₹') || /\b[1-5],000\b/.test(cardTxt);
+                if (!isOos && hasPrice) {
+                    stock[d] = true;
+                }
+            }
+
+            return { hydrated: true, stock };
+        }""")
+        if not res or not res.get("hydrated"):
+            return False, dict(self.monitor_stock_map)
+        stock_map = {d: bool(res["stock"].get(d, False)) for d in self.VALID_DENOMS}
+        return True, stock_map
+
+    async def _monitor_worker(self):
+        """
+        Dedicated 10-second guest MONITOR tab.
+        Keeps all 5 logged-in slots completely quiet until stock appears,
+        then wakes ALL logged-in accounts simultaneously in <1 millisecond!
+        """
+        log_step(self.MONITOR_SLOT_ID, "🚀 Dedicated 10-second Light Monitor started!")
+        cycle = 0
+
+        while True:
+            t0 = time.monotonic()
+            try:
+                cycle += 1
+                if cycle % 60 == 0:
+                    try:
+                        await self.browser.reset_slot_page(self.MONITOR_SLOT_ID)
+                    except Exception:
+                        pass
+
+                page = await self.browser.get_page(self.MONITOR_SLOT_ID)
+                cb = int(time.time() * 1000)
+                fresh_url = (
+                    f"{settings.product_url}?cb={cb}"
+                    if "?" not in settings.product_url
+                    else f"{settings.product_url}&cb={cb}"
+                )
+
+                await page.goto(fresh_url, wait_until="domcontentloaded", timeout=18000)
+                await self._destroy_location_popup(page, self.MONITOR_SLOT_ID)
+
+                # Poll every 80ms up to 3.2s for Next.js cards to hydrate
+                hydrated = False
+                stock_map = dict(self.monitor_stock_map)
+                for _ in range(40):
+                    hydrated, stock_map = await self._scan_all_denoms_on_page(page)
+                    if hydrated:
+                        break
+                    await asyncio.sleep(0.08)
+
+                if hydrated:
+                    self.monitor_stock_map = stock_map
+                    self.monitor_last_check = now_ist_time()
+                    target = self.target_denom
+                    target_live = bool(stock_map.get(target, False))
+                    any_live = any(stock_map.values())
+
+                    if target_live:
+                        self.monitor_state = f"🚨 Rs.{target} IN STOCK!"
+                        is_fresh_drop = not self._monitor_was_target_in_stock
+                        self._monitor_was_target_in_stock = True
+
+                        if is_fresh_drop:
+                            self.current_drop_id += 1
+                            log_step(
+                                self.MONITOR_SLOT_ID,
+                                f"🚨 DROP #{self.current_drop_id}: Rs.{target} IN STOCK! Waking all accounts in parallel!",
+                            )
+
+                        # Check if any logged-in account still needs to buy in this drop
+                        armed_pending = [
+                            sid
+                            for sid, acc in self.accounts.items()
+                            if acc.logged_in and self.slot_bought_drop.get(sid) != self.current_drop_id
+                        ]
+
+                        if armed_pending:
+                            self._ensure_snipers_running()
+                            self.stock_event.set()
+                            asyncio.create_task(self._clear_stock_event_delayed())
+
+                            now_ts = time.monotonic()
+                            if is_fresh_drop or (now_ts - self._last_stock_alert_ts > 45.0):
+                                self._last_stock_alert_ts = now_ts
+                                if self.telegram.application is not None:
+                                    asyncio.create_task(
+                                        self.telegram.send_message(
+                                            f"🚨 <b>STOCK DETECTED BY 10s MONITOR!</b>\n"
+                                            f"🎯 <b>Target Live:</b> <code>Rs.{esc(target)} Wallet Code</code>\n"
+                                            f"⚡ Waking <b>{len(armed_pending)}</b> accounts simultaneously "
+                                            f"(<code>{esc(', '.join(armed_pending))}</code>)!\n"
+                                            f"📦 Qty: <code>{self.target_qty}</code> | 🛡️ Abort: <code>{esc(self._abort_label())}</code>",
+                                            parse_mode="HTML",
+                                        )
+                                    )
+                    else:
+                        self._monitor_was_target_in_stock = False
+                        if any_live:
+                            other_live = [f"Rs.{d}" for d in self.VALID_DENOMS if stock_map.get(d)]
+                            self.monitor_state = f"👀 Target OOS (Live: {', '.join(other_live)})"
+                        else:
+                            self.monitor_state = f"🟢 Active (10s Loop | All OOS)"
+                else:
+                    self.monitor_state = "⚠️ Slow Render (Retrying in 10s)"
+
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                log_step(self.MONITOR_SLOT_ID, f"Monitor cycle note: {str(err)[:70]}")
+                self.monitor_state = "🛠️ Auto-Healing Monitor Tab..."
+                try:
+                    await self.browser.reset_slot_page(self.MONITOR_SLOT_ID)
+                except Exception:
+                    pass
+
+            elapsed = time.monotonic() - t0
+            sleep_for = max(1.5, self.MONITOR_INTERVAL_SEC - elapsed)
+            await asyncio.sleep(sleep_for)
+
+    # =========================================================
+    # 🎯 SVG-SAFE CARD SELECTOR, VERIFIED QTY & MILLISECOND ABORT
     # =========================================================
 
     async def _find_and_select_denomination(self, page, denom: str) -> Tuple[str, int]:
         """
-        Finds the exact 'Rs.<denom> Wallet Code' card under Select Options, clicks it with a real
-        Playwright mouse click, and STRICTLY VERIFIES that the '- <qty> +' stepper pill moved
-        onto THAT exact denomination card.
-        Returns: (status, live_qty_on_card)
-          status in ('selected', 'oos', 'not_found')
+        Inspects ALL 5 cards together to detect the active card via BOTH:
+          1) SVG-safe '- <qty> +' pill detection on top-right of the card, AND
+          2) Relative border/highlight comparison across all 5 cards (immune to CSS RGB tweaks).
+        Clicks the exact target card and strictly verifies selection before buying!
         """
-        target_label = f"Rs.{denom} Wallet Code"
+        target_denom = str(denom).strip()
 
-        async def _inspect_card():
+        async def _inspect_grid():
             return await page.evaluate(
-                r"""(label) => {
-                    const lowerLabel = label.toLowerCase();
+                r"""(targetDenom) => {
+                    const denoms = ['1000', '2000', '3000', '4000', '5000'];
                     const allEls = Array.from(document.querySelectorAll('div, button, span, p'));
-                    let labelEl = null;
+                    const cards = {};
 
-                    for (const el of allEls) {
-                        const t = (el.innerText || '').trim().toLowerCase();
-                        if (t === lowerLabel && el.offsetParent !== null) {
-                            labelEl = el;
-                            break;
+                    // Helper: detect '- <digit> +' pill overlapping card's top-right edge (works with text OR SVG icons!)
+                    const findPillForRect = (rect) => {
+                        const boxes = Array.from(document.querySelectorAll('div, span'));
+                        let best = null;
+                        for (const b of boxes) {
+                            if (b.offsetParent === null) continue;
+                            const br = b.getBoundingClientRect();
+                            if (br.width < 42 || br.width > 180 || br.height < 18 || br.height > 56) continue;
+                            const overlapsX = br.left >= rect.left - 15 && br.right <= rect.right + 25;
+                            const overlapsY = br.top >= rect.top - 28 && br.bottom <= rect.bottom + 15;
+                            if (!overlapsX || !overlapsY) continue;
+
+                            const raw = (b.innerText || '').replace(/\s+/g, ' ').trim();
+                            // Matches "1", "- 1 +", "− 2 +", etc. — NEVER matches "₹3,000" or "Rs.3000"
+                            const m = raw.match(/^(?:[-−]\s*)?([1-9])(?:\s*\+)?$/);
+                            if (!m) continue;
+
+                            const hasControls =
+                                raw.includes('+') ||
+                                raw.includes('-') ||
+                                raw.includes('−') ||
+                                b.querySelectorAll('button, svg').length >= 2 ||
+                                b.children.length >= 2;
+
+                            if (!hasControls) continue;
+
+                            // Prefer the tightest pill box (smallest area)
+                            const area = br.width * br.height;
+                            if (!best || area < best.area) {
+                                best = { qty: parseInt(m[1], 10), area };
+                            }
                         }
-                    }
-                    if (!labelEl) {
+                        return best ? best.qty : null;
+                    };
+
+                    for (const d of denoms) {
+                        const label = `rs.${d} wallet code`;
+                        let labelEl = null;
                         for (const el of allEls) {
                             const t = (el.innerText || '').trim().toLowerCase();
-                            if (t.startsWith(lowerLabel + '\n') && t.length < 90 && el.offsetParent !== null) {
+                            if ((t === label || t.startsWith(label + '\n')) && t.length < 95 && el.offsetParent !== null) {
                                 labelEl = el;
                                 break;
                             }
                         }
-                    }
-                    if (!labelEl) return { status: 'waiting' };
+                        if (!labelEl) continue;
 
-                    // Climb up to the exact single denomination card container
-                    // (must contain price or 'out of stock', and must NOT contain any other 'rs.XXXX wallet code')
-                    let card = labelEl;
-                    let cur = labelEl;
-                    for (let depth = 0; depth < 6 && cur && cur.parentElement; depth++) {
-                        const parentTxt = (cur.parentElement.innerText || '').toLowerCase();
-                        const otherMatches = parentTxt.match(/rs\.\d{4}\s*wallet code/g) || [];
-                        if (otherMatches.length > 1) break;
-                        cur = cur.parentElement;
-                        if (parentTxt.includes('out of stock') || parentTxt.includes('₹')) {
-                            card = cur;
+                        let card = labelEl;
+                        let cur = labelEl;
+                        for (let depth = 0; depth < 6 && cur && cur.parentElement; depth++) {
+                            const pt = (cur.parentElement.innerText || '').toLowerCase();
+                            if ((pt.match(/rs\.\d{4}\s*wallet code/g) || []).length > 1) break;
+                            cur = cur.parentElement;
+                            if (pt.includes('out of stock') || pt.includes('₹')) {
+                                card = cur;
+                            }
                         }
+
+                        const cardTxt = (card.innerText || '').toLowerCase();
+                        const isOos = cardTxt.includes('out of stock');
+                        const hasPrice = cardTxt.includes('₹') || /\b[1-5],000\b/.test(cardTxt);
+                        const rect = card.getBoundingClientRect();
+                        const cs = window.getComputedStyle(card);
+                        const styleSig = `${cs.borderColor}|${cs.borderWidth}|${cs.backgroundColor}|${cs.boxShadow}`;
+                        const pillQty = (!isOos && hasPrice) ? findPillForRect(rect) : null;
+
+                        cards[d] = {
+                            denom: d,
+                            status: isOos ? 'oos' : (hasPrice ? 'in_stock' : 'waiting'),
+                            styleSig,
+                            pillQty,
+                            cx: rect.left + Math.min(rect.width * 0.35, 85),
+                            cy: rect.top + rect.height * 0.65,
+                        };
                     }
 
-                    const cardTxt = (card.innerText || '').toLowerCase();
-                    if (cardTxt.includes('out of stock')) {
-                        return { status: 'oos' };
-                    }
-                    if (!cardTxt.includes('₹') && !cardTxt.includes('rs.')) {
+                    const target = cards[targetDenom];
+                    if (!target || target.status === 'waiting') {
                         return { status: 'waiting' };
                     }
+                    if (target.status === 'oos') {
+                        return { status: 'oos' };
+                    }
 
-                    const rect = card.getBoundingClientRect();
+                    // Determine relative highlight: if target's border/bg style is unique among in-stock cards
+                    const sigCounts = {};
+                    const allCards = Object.values(cards);
+                    for (const c of allCards) {
+                        sigCounts[c.styleSig] = (sigCounts[c.styleSig] || 0) + 1;
+                    }
+                    const isUniqueHighlight = allCards.length >= 2 && sigCounts[target.styleSig] === 1;
 
-                    // Check if the '- <qty> +' pill is currently attached to THIS exact card
-                    // (either inside card DOM or positioned on top-right edge of this card)
-                    const checkStepperInside = (rootEl) => {
-                        const lines = (rootEl.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
-                        const hasPlus = lines.includes('+');
-                        const hasMinus = lines.includes('-') || lines.includes('−');
-                        if (hasPlus || hasMinus) {
-                            for (const ln of lines) {
-                                if (/^\d+$/.test(ln)) {
-                                    const n = parseInt(ln, 10);
-                                    if (n >= 1 && n <= 10) return n;
-                                }
-                            }
-                        }
-                        return null;
-                    };
-
-                    let stepperQty = checkStepperInside(card);
-
-                    // Also check floating sibling pill positioned over this card's top-right corner
-                    if (stepperQty === null) {
-                        const candidates = Array.from(document.querySelectorAll('div, span'));
-                        for (const c of candidates) {
-                            if (c.offsetParent === null) continue;
-                            const cr = c.getBoundingClientRect();
-                            if (cr.width < 40 || cr.width > 160 || cr.height < 18 || cr.height > 55) continue;
-                            // Must overlap this card's bounding box horizontally and near top edge
-                            const overlapsX = cr.left >= rect.left - 15 && cr.right <= rect.right + 20;
-                            const overlapsY = cr.top >= rect.top - 25 && cr.bottom <= rect.bottom + 15;
-                            if (!overlapsX || !overlapsY) continue;
-                            const q = checkStepperInside(c);
-                            if (q !== null) {
-                                stepperQty = q;
-                                break;
-                            }
+                    // Also check if another card explicitly holds the pill right now
+                    let otherHasPill = false;
+                    for (const c of allCards) {
+                        if (c.denom !== targetDenom && c.pillQty !== null) {
+                            otherHasPill = true;
+                            break;
                         }
                     }
 
-                    // Check visual blue active border as secondary verification
-                    const style = window.getComputedStyle(card);
-                    const borderColor = (style.borderColor || '').toLowerCase();
-                    const isBlueBorder =
-                        borderColor.includes('rgb(59') ||
-                        borderColor.includes('rgb(37') ||
-                        borderColor.includes('rgb(29') ||
-                        borderColor.includes('rgb(0, 1') ||
-                        (card.className || '').toLowerCase().includes('blue') ||
-                        (card.className || '').toLowerCase().includes('active') ||
-                        (card.className || '').toLowerCase().includes('selected');
+                    const selected = (target.pillQty !== null) || (isUniqueHighlight && !otherHasPill);
 
                     return {
                         status: 'in_stock',
-                        selected: stepperQty !== null || isBlueBorder,
-                        qty: stepperQty !== null ? stepperQty : 1,
-                        cx: rect.left + Math.min(rect.width * 0.35, 90),
-                        cy: rect.top + rect.height * 0.65,
+                        selected,
+                        qty: target.pillQty !== null ? target.pillQty : 1,
+                        cx: target.cx,
+                        cy: target.cy,
                     };
                 }""",
-                target_label,
+                target_denom,
             )
 
-        # Wait up to 2.5s for card grid to hydrate
         info = None
         for _ in range(35):
-            info = await _inspect_card()
+            info = await _inspect_grid()
             if info and info.get("status") in ("oos", "in_stock"):
                 break
             await asyncio.sleep(0.07)
@@ -1928,22 +2222,26 @@ class AccountController:
         if info.get("selected"):
             return "selected", int(info.get("qty") or 1)
 
-        # Click exact target card center (lower-left area so we never accidentally hit a pill)
+        # Click target card lower-left area with real Playwright mouse click + locator fallback
+        target_label = f"Rs.{target_denom} Wallet Code"
         for attempt in range(3):
-            cx, cy = info["cx"], info["cy"]
-            await page.mouse.click(cx, cy)
+            await page.mouse.click(info["cx"], info["cy"])
+            if attempt >= 1:
+                try:
+                    loc = page.locator(f"text={target_label} >> visible=true").first
+                    await loc.click(force=True, timeout=1500)
+                except Exception:
+                    pass
 
-            # Verify the '- 1 +' stepper actually moved onto our target card!
-            for _ in range(16):
+            for _ in range(18):
                 await asyncio.sleep(0.05)
-                check = await _inspect_card()
+                check = await _inspect_grid()
                 if check and check.get("status") == "oos":
                     return "oos", 1
                 if check and check.get("selected"):
                     return "selected", int(check.get("qty") or 1)
 
-            # Refresh coordinates before retry
-            info = await _inspect_card()
+            info = await _inspect_grid()
             if not info or info.get("status") != "in_stock":
                 return "not_found", 1
 
@@ -1951,10 +2249,8 @@ class AccountController:
 
     async def _set_and_verify_quantity(self, page, denom: str, desired_qty: int) -> Tuple[bool, int]:
         """
-        Reads the exact live quantity inside the selected 'Rs.<denom>' card's '- <qty> +' pill.
-        - If desired_qty == live_qty: does NOTHING (0ms!).
-        - If desired_qty != live_qty: clicks the exact '+' or '-' button inside THAT card's pill
-          using a real Playwright mouse click and STRICTLY VERIFIES that the displayed number changed!
+        SVG-safe quantity controller on the selected 'Rs.<denom>' card's '- <qty> +' pill.
+        Strictly verifies that the displayed number actually becomes desired_qty.
         """
         target_label = f"Rs.{denom} Wallet Code"
 
@@ -1966,7 +2262,7 @@ class AccountController:
                     let labelEl = null;
                     for (const el of allEls) {
                         const t = (el.innerText || '').trim().toLowerCase();
-                        if ((t === lowerLabel || t.startsWith(lowerLabel + '\n')) && t.length < 90 && el.offsetParent !== null) {
+                        if ((t === lowerLabel || t.startsWith(lowerLabel + '\n')) && t.length < 95 && el.offsetParent !== null) {
                             labelEl = el;
                             break;
                         }
@@ -1983,41 +2279,45 @@ class AccountController:
                     }
                     const rect = card.getBoundingClientRect();
 
-                    // Find the exact '- <qty> +' pill overlapping this card's top-right area
                     let pill = null;
                     let qtyVal = null;
+                    let bestArea = Infinity;
                     const boxes = Array.from(document.querySelectorAll('div, span'));
                     for (const b of boxes) {
                         if (b.offsetParent === null) continue;
                         const br = b.getBoundingClientRect();
-                        if (br.width < 40 || br.width > 170 || br.height < 18 || br.height > 55) continue;
-                        const overlapsX = br.left >= rect.left - 15 && br.right <= rect.right + 20;
-                        const overlapsY = br.top >= rect.top - 25 && br.bottom <= rect.bottom + 15;
+                        if (br.width < 42 || br.width > 180 || br.height < 18 || br.height > 56) continue;
+                        const overlapsX = br.left >= rect.left - 15 && br.right <= rect.right + 25;
+                        const overlapsY = br.top >= rect.top - 28 && br.bottom <= rect.bottom + 15;
                         if (!overlapsX || !overlapsY) continue;
 
-                        const txt = (b.innerText || '').trim();
-                        const lines = txt.split(/\s+/).filter(Boolean);
-                        if (lines.includes('+') || lines.includes('-') || lines.includes('−')) {
-                            for (const ln of lines) {
-                                if (/^\d+$/.test(ln)) {
-                                    const n = parseInt(ln, 10);
-                                    if (n >= 1 && n <= 10) {
-                                        pill = b;
-                                        qtyVal = n;
-                                        break;
-                                    }
-                                }
-                            }
+                        const raw = (b.innerText || '').replace(/\s+/g, ' ').trim();
+                        const m = raw.match(/^(?:[-−]\s*)?([1-9])(?:\s*\+)?$/);
+                        if (!m) continue;
+
+                        const hasControls =
+                            raw.includes('+') ||
+                            raw.includes('-') ||
+                            raw.includes('−') ||
+                            b.querySelectorAll('button, svg').length >= 2 ||
+                            b.children.length >= 2;
+                        if (!hasControls) continue;
+
+                        const area = br.width * br.height;
+                        if (area < bestArea) {
+                            bestArea = area;
+                            pill = b;
+                            qtyVal = parseInt(m[1], 10);
                         }
-                        if (pill) break;
                     }
 
                     if (!pill) return null;
                     const pr = pill.getBoundingClientRect();
 
-                    // Find exact '+' and '-' child clickable elements inside the pill
                     let plusBox = null;
                     let minusBox = null;
+
+                    // 1. Check explicit '+'/'-' text children
                     const kids = Array.from(pill.querySelectorAll('button, span, div, svg'));
                     for (const k of kids) {
                         const kt = (k.innerText || '').trim();
@@ -2030,7 +2330,22 @@ class AccountController:
                         }
                     }
 
-                    // Geometric fallback on left/right edges of the pill if buttons are SVG-only
+                    // 2. If icons are SVGs/buttons without text, take leftmost & rightmost clickable controls inside pill
+                    if (!minusBox || !plusBox) {
+                        const ctrls = Array.from(pill.querySelectorAll('button, svg'))
+                            .map(c => {
+                                const r = c.getBoundingClientRect();
+                                return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+                            })
+                            .filter(c => c.w > 4 && c.h > 4)
+                            .sort((a, b) => a.x - b.x);
+                        if (ctrls.length >= 2) {
+                            if (!minusBox) minusBox = { x: ctrls[0].x, y: ctrls[0].y };
+                            if (!plusBox) plusBox = { x: ctrls[ctrls.length - 1].x, y: ctrls[ctrls.length - 1].y };
+                        }
+                    }
+
+                    // 3. Geometric fallback on left/right edges of pill
                     if (!minusBox) {
                         minusBox = { x: pr.left + pr.width * 0.18, y: pr.top + pr.height / 2 };
                     }
@@ -2055,7 +2370,6 @@ class AccountController:
             btn = stepper["plus"] if desired_qty > current_qty else stepper["minus"]
             await page.mouse.click(btn["x"], btn["y"])
 
-            # Poll every 40ms up to 800ms to confirm the counter actually updated!
             for _ in range(20):
                 await asyncio.sleep(0.04)
                 updated = await _locate_stepper()
@@ -2096,7 +2410,6 @@ class AccountController:
                     return null;
                 };
 
-                // 1. Explicit Total Payable / Paid Amount / Amount Payable / To Pay
                 const explicitPayable = findValueNear(
                     /^(?:total\s*payable|payable\s*amount|amount\s*payable|grand\s*total|to\s*pay|net\s*payable|paid\s*amount|total\s*amount)/i
                 );
@@ -2104,13 +2417,11 @@ class AccountController:
                     return explicitPayable;
                 }
 
-                // 2. Explicit 'Total Fees' (e.g. ₹156 in Rooter's Bill Details)
                 const totalFees = findValueNear(/^total\s*fees/i);
                 if (totalFees !== null && totalFees >= 0 && totalFees <= baseTotal) {
                     return baseTotal + totalFees;
                 }
 
-                // 3. Individual 'Platform Fees' + 'Surge Fees' + 'Convenience Fees'
                 const platformFee = findValueNear(/^platform\s*fees?/i);
                 const surgeFee = findValueNear(/^surge\s*fees?/i);
                 const convFee = findValueNear(/^convenience\s*fees?/i);
@@ -2129,8 +2440,7 @@ class AccountController:
     ) -> Tuple[bool, Optional[Dict]]:
         """
         Millisecond surge-price protector.
-        Returns: (allowed_to_buy, price_info_dict)
-        If self.abort_limit_pct is None (OFF), returns (True, None) in 0ms!
+        Calculates exact per-code cost (total_payable / qty) and aborts if extra % > abort_limit_pct.
         """
         if self.abort_limit_pct is None:
             return True, None
@@ -2138,7 +2448,6 @@ class AccountController:
         face_value = int(denom)
         payable = await self._extract_payable_from_dom(page, face_value, qty)
 
-        # If bill isn't expanded yet on product page, peek 'View Detailed Bill' in ~150ms
         opened_bill = False
         if payable is None and peek_bill:
             clicked_bill = await page.evaluate(r"""() => {
@@ -2154,13 +2463,12 @@ class AccountController:
             }""")
             if clicked_bill:
                 opened_bill = True
-                for _ in range(14):
+                for _ in range(15):
                     await asyncio.sleep(0.04)
                     payable = await self._extract_payable_from_dom(page, face_value, qty)
                     if payable is not None:
                         break
 
-        # If bill opened a modal covering the Pay button, close it cleanly so Pay stays clickable
         if opened_bill:
             pay_still_visible = False
             try:
@@ -2175,7 +2483,6 @@ class AccountController:
                     pass
 
         if payable is None:
-            # Bill wasn't available here yet; we'll re-verify inside Delivery Details modal before final pay!
             return True, None
 
         per_code_cost = payable / max(1, qty)
@@ -2195,7 +2502,7 @@ class AccountController:
         if extra_pct > (self.abort_limit_pct + 0.001):
             log_step(
                 slot_id,
-                f"🛑 ABORTED! Rs.{denom}x{qty} payable=₹{payable:.2f} (₹{per_code_cost:.2f}/code = +{extra_pct:.2f}% > {self.abort_limit_pct}% limit)",
+                f"🛑 ABORTED! Rs.{denom}x{qty} payable=₹{payable:.2f} (₹{per_code_cost:.2f}/code = +{extra_pct:.2f}% > {self.abort_limit_pct}%)",
             )
             return False, info
 
@@ -2208,15 +2515,6 @@ class AccountController:
     async def _verify_order_page_and_extract_details(
         self, page, timeout_sec: float = 16.0
     ) -> Tuple[bool, Dict]:
-        """
-        Strictly verifies that the browser reached Rooter's Payment / Order Confirmation page
-        (#MO_..., 'items delivered successfully', 'Coupon Codes' -> 'Code #01') and extracts:
-          - order_id
-          - codes (list)
-          - actual_qty (int or None)
-          - actual_product (str or None)
-          - paid_amount (str or None)
-        """
         deadline = time.monotonic() + timeout_sec
         reached = False
         latest: Dict = {
@@ -2234,7 +2532,6 @@ class AccountController:
                     const lower = body.toLowerCase();
                     const url = (window.location.href || '').toLowerCase();
 
-                    // Dismiss floating promo/sale popup ('X') on right side for a crisp screenshot
                     const closeEls = Array.from(document.querySelectorAll('button, span, div, svg'));
                     for (const el of closeEls) {
                         const t = (el.innerText || '').trim();
@@ -2262,7 +2559,6 @@ class AccountController:
                     const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
                     const codes = [];
 
-                    // Method 1: Exact Rooter 'Code #01' / 'Code #02' next-line parser
                     for (let i = 0; i < lines.length; i++) {
                         if (/^code\s*#?\s*\d+/i.test(lines[i])) {
                             for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
@@ -2280,13 +2576,11 @@ class AccountController:
                         }
                     }
 
-                    // Method 2: Standard PSN 12-char hyphenated format (XXXX-XXXX-XXXX)
                     const psnMatches = body.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g) || [];
                     for (const m of psnMatches) {
                         codes.push(m);
                     }
 
-                    // Extract real purchased quantity & denomination from order details
                     let actualQty = null;
                     let actualProduct = null;
                     const itemMatch = body.match(/(\d+)\s*[xX]\s*([^\n₹]+Wallet Code)/i);
@@ -2298,7 +2592,6 @@ class AccountController:
                         if (purMatch) actualQty = parseInt(purMatch[1], 10);
                     }
 
-                    // Extract Paid Amount
                     let paidAmount = null;
                     for (let i = 0; i < lines.length; i++) {
                         if (/^paid\s*amount/i.test(lines[i])) {
@@ -2341,164 +2634,146 @@ class AccountController:
         return reached, latest
 
     # =========================================================
-    # 🎯 HIGH-SPEED SWARM SNIPER WORKER (TUNED FOR 8vCPU / 8GB)
+    # 🎯 QUIET STANDBY + MILLISECOND PARALLEL ATTACK WORKER
     # =========================================================
 
     async def _sniper_worker(self, slot_id: str):
+        """
+        Stays logged-in, pre-warmed, and completely QUIET on the product page (0 idle refreshes).
+        The millisecond the 10s Monitor sets self.stock_event, ALL slots wake up together,
+        run 1 fast refresh, verify denomination + quantity + abort limit, and buy!
+        """
         account = self.get_account(slot_id)
+        self._ensure_monitor_running()
 
+        # Gentle stagger only during initial warm-up so CPU stays cool
         try:
             slot_num = int(slot_id.split("-A")[-1])
-            await asyncio.sleep((slot_num - 1) * 2.0)
+            await asyncio.sleep((slot_num - 1) * 1.5)
         except Exception:
             pass
 
+        # Pre-warm this account's tab once so cookies, session & page are ready
+        try:
+            page = await self.browser.ensure_product_page(slot_id)
+            await self._destroy_location_popup(page, slot_id)
+            await self._update_live_balance(page, account)
+            await self.browser.save_session(slot_id, account.phone_number)
+        except Exception as warm_err:
+            log_step(slot_id, f"Initial warm note: {warm_err}")
+
         log_step(
             slot_id,
-            f"Swarm Sniper started! Target: Rs.{self.target_denom} x {self.target_qty} | Abort: {self._abort_label()}",
+            f"🟢 Quiet Standby Armed | Target: Rs.{self.target_denom}x{self.target_qty} | Abort: {self._abort_label()}",
         )
-        await self.telegram.send_message(
-            f"🎯 <b>Swarm Sniper ACTIVATED</b> for <b>{esc(slot_id)}</b>\n"
-            f"• Target: <code>Rs.{esc(self.target_denom)}</code> | Qty: <code>{self.target_qty}</code> | Abort: <code>{esc(self._abort_label())}</code>",
-            parse_mode="HTML",
-        )
-
-        cycle_count = 0
 
         while account.logged_in:
             try:
-                target_denom = self.target_denom
-                prefed_qty = self.target_qty
-
-                cycle_count += 1
-                if cycle_count % 60 == 0:
-                    try:
-                        await self.browser.save_session(slot_id, account.phone_number)
-                        await self.browser.reset_slot_page(slot_id)
-                    except Exception:
-                        pass
-
-                last_time = now_ist_time()
                 account.update(
-                    current_page=f"⏳ [Wait 18s | Rs.{target_denom}x{prefed_qty}] ({last_time})",
+                    current_page=f"🟢 Warm & Quiet (Standby | Rs.{self.target_denom}x{self.target_qty})",
                     last_error=None,
                 )
 
+                # Stay 100% QUIET until 10s Monitor detects stock (or manual Trigger Buy)
+                triggered = False
                 try:
-                    await asyncio.wait_for(self.stock_event.wait(), timeout=18.0)
-                    account.update(current_page=f"⚡ [Swarm Triggered! Attacking Rs.{target_denom}!]")
+                    await asyncio.wait_for(self.stock_event.wait(), timeout=600.0)
+                    triggered = True
                 except asyncio.TimeoutError:
-                    pass
+                    # Silent 10-minute keep-alive: save session & verify tab is alive without hammering site
+                    if account.logged_in:
+                        try:
+                            await self.browser.save_session(slot_id, account.phone_number)
+                            p = await self.browser.get_page(slot_id)
+                            if p.is_closed() or not p.url or p.url == "about:blank":
+                                await self.browser.open_product_page(slot_id)
+                        except Exception:
+                            pass
+                    continue
 
                 if not account.logged_in:
                     break
 
-                # Always pick up latest settings changed via /start buttons or commands
+                if not triggered:
+                    continue
+
+                # Skip if this slot already successfully purchased in the current stock drop
+                active_drop_id = self.current_drop_id
+                if active_drop_id > 0 and self.slot_bought_drop.get(slot_id) == active_drop_id:
+                    await asyncio.sleep(2.0)
+                    continue
+
                 target_denom = self.target_denom
                 prefed_qty = self.target_qty
 
+                log_step(slot_id, f"⚡ WOKEN BY MONITOR! Executing instant refresh & buy for Rs.{target_denom}x{prefed_qty}!")
+                account.update(current_page=f"⚡ [ATTACKING Rs.{target_denom}x{prefed_qty}!]")
+
                 page = await self.browser.get_page(slot_id)
 
-                account.update(current_page="🔄 [Refreshing Product Page]")
-                cache_buster = int(time.time() * 1000)
+                # 1 SINGLE FAST REFRESH UPON STOCK DETECTION
+                cb = int(time.time() * 1000)
                 fresh_url = (
-                    f"{settings.product_url}?cb={cache_buster}"
+                    f"{settings.product_url}?cb={cb}"
                     if "?" not in settings.product_url
-                    else f"{settings.product_url}&cb={cache_buster}"
+                    else f"{settings.product_url}&cb={cb}"
                 )
-
-                await page.goto(fresh_url, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(0.35)
+                await page.goto(fresh_url, wait_until="domcontentloaded", timeout=22000)
                 await self._destroy_location_popup(page, slot_id)
 
                 content = await page.content()
                 if "Application error: a client-side exception" in content:
-                    account.update(last_error="Website White Screen - Auto Retrying")
-                    await asyncio.sleep(2.0)
+                    account.update(last_error="Website White Screen - Retrying")
+                    await asyncio.sleep(1.5)
                     continue
 
-                # STRICT DENOMINATION SELECTION & VERIFICATION (Never buys default Rs.1000 by mistake!)
+                # STRICT SVG-SAFE DENOMINATION SELECTION & VERIFICATION
                 account.update(current_page=f"🎯 [Selecting Rs.{target_denom}]")
-                sel_status, live_card_qty = await self._find_and_select_denomination(page, target_denom)
+                sel_status, _ = await self._find_and_select_denomination(page, target_denom)
 
                 if sel_status == "oos":
-                    account.update(current_page=f"😴 [Rs.{target_denom} Out of Stock] ({now_ist_time()})")
-                    await asyncio.sleep(0.8)
+                    account.update(current_page=f"😴 [Rs.{target_denom} Gone OOS] ({now_ist_time()})")
+                    await asyncio.sleep(2.0)
                     continue
 
                 if sel_status != "selected":
                     account.update(
-                        current_page=f"⚠️ [Rs.{target_denom} Not Confirmed - Retrying]",
+                        current_page=f"⚠️ [Rs.{target_denom} Select Unconfirmed]",
                         last_error=f"Could not verify Rs.{target_denom} selection",
                     )
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.5)
                     continue
 
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.15)
                 await self._update_live_balance(page, account)
 
-                pay_btn_1 = page.locator("button >> text='Pay via wallet' >> visible=true").first
-                is_in_stock = False
-                try:
-                    is_in_stock = await pay_btn_1.is_visible(timeout=1400)
-                except Exception:
-                    pass
-
-                if not is_in_stock:
-                    account.update(current_page=f"😴 [Rs.{target_denom} OOS / Low Bal] ({now_ist_time()})")
-                    await asyncio.sleep(0.8)
-                    continue
-
-                log_step(slot_id, f"🚨 Rs.{target_denom} IN STOCK! Launching buy (Qty: {prefed_qty}, Abort: {self._abort_label()})")
-                account.update(current_page=f"🚨 [BUYING Rs.{target_denom} x {prefed_qty}!]")
-
-                if not self.stock_event.is_set():
-                    self.stock_event.set()
-                    asyncio.create_task(self._clear_stock_event_delayed())
-
-                asyncio.create_task(
-                    self.telegram.send_message(
-                        f"🚨 <b>Rs.{esc(target_denom)} STOCK DETECTED in {esc(slot_id)}!</b>\n"
-                        f"⚡ Waking all accounts | Target: <code>Rs.{esc(target_denom)}</code> | "
-                        f"Qty: <code>{prefed_qty}</code> | Abort: <code>{esc(self._abort_label())}</code>",
-                        parse_mode="HTML",
-                    )
-                )
-
-                # If pre-fed Qty is 1 -> only [1]. If Qty 2 -> [2, 1] (tries 2 first, falls back to 1 on low balance).
                 qty_attempts = [1] if prefed_qty == 1 else [2, 1]
                 purchase_completed = False
                 aborted_due_to_surge = False
 
                 for attempt_qty in qty_attempts:
                     try:
-                        # Ensure we are on product page with exact target denomination selected
                         if "playstation-gift-cards" not in (page.url or "").lower():
-                            await page.goto(fresh_url, wait_until="domcontentloaded", timeout=25000)
-                            await asyncio.sleep(0.35)
+                            await page.goto(fresh_url, wait_until="domcontentloaded", timeout=20000)
                             await self._destroy_location_popup(page, slot_id)
                             re_sel, _ = await self._find_and_select_denomination(page, target_denom)
                             if re_sel != "selected":
                                 continue
 
-                        # STRICT QUANTITY SELECTION & VERIFICATION
+                        # STRICT SVG-SAFE QUANTITY SELECTION & VERIFICATION
                         account.update(current_page=f"🔢 [Setting Qty → {attempt_qty}]")
                         qty_ok, verified_qty = await self._set_and_verify_quantity(
                             page, target_denom, desired_qty=attempt_qty
                         )
                         if not qty_ok:
-                            log_step(slot_id, f"Could not verify Qty {attempt_qty} (still {verified_qty})")
-                            if attempt_qty == 2:
-                                # Could not bump to 2 (maybe stock/limit is 1); fall back cleanly to 1
-                                continue
-                            else:
-                                continue
+                            log_step(slot_id, f"Qty {attempt_qty} not verified (still {verified_qty})")
+                            continue
 
-                        # Check wallet sufficiency dynamically via 'Pay via wallet' visibility
+                        # Dynamic wallet sufficiency check via 'Pay via wallet'
                         pay_btn_1 = page.locator("button >> text='Pay via wallet' >> visible=true").first
                         can_pay_wallet = False
                         try:
-                            can_pay_wallet = await pay_btn_1.is_visible(timeout=1200)
+                            can_pay_wallet = await pay_btn_1.is_visible(timeout=1400)
                         except Exception:
                             pass
 
@@ -2513,10 +2788,10 @@ class AccountController:
                                 )
                                 continue
                             else:
-                                account.update(current_page="🛑 [Stopped - Insufficient Balance for Qty 1]")
+                                account.update(current_page="🛑 [Stopped - Low Balance / OOS]")
                                 asyncio.create_task(
                                     self.telegram.send_message(
-                                        f"🛑 <b>{esc(slot_id)}</b>: <code>Rs.{esc(target_denom)} x 1</code> ke liye wallet balance kam hai.",
+                                        f"🛑 <b>{esc(slot_id)}</b>: <code>Rs.{esc(target_denom)} x 1</code> ke liye wallet balance kam hai (ya OOS).",
                                         parse_mode="HTML",
                                     )
                                 )
@@ -2544,8 +2819,7 @@ class AccountController:
                                         f"📊 <b>Per Code Cost:</b> <code>₹{price_info['per_code_cost']:,.2f}</code> "
                                         f"(<b>+{price_info['extra_pct']:.2f}%</b>)\n"
                                         f"🛑 <b>Your Abort Limit:</b> <code>≤ {price_info['limit_pct']}%</code> "
-                                        f"(Max <code>₹{price_info['max_per_code']:,.2f}/code</code>)\n\n"
-                                        "Buy skip kar diya gaya! Limit badhani ho toh <code>/start</code> → <b>Abort Limit</b> dabao.",
+                                        f"(Max <code>₹{price_info['max_per_code']:,.2f}/code</code>)",
                                         parse_mode="HTML",
                                     )
                                 )
@@ -2561,9 +2835,9 @@ class AccountController:
                         await page.locator("text=Delivery Details >> visible=true").wait_for(
                             state="visible", timeout=5000
                         )
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.18)
 
-                        # MILLISECOND PRICE SURGE ABORT CHECK (Pass 2: Double-Check Inside Delivery Modal!)
+                        # MILLISECOND PRICE SURGE ABORT CHECK (Pass 2: Inside Delivery Details Modal)
                         if self.abort_limit_pct is not None and price_info is None:
                             modal_ok, modal_info = await self._check_price_abort_limit(
                                 page, slot_id, target_denom, verified_qty, peek_bill=False
@@ -2613,8 +2887,9 @@ class AccountController:
                             account.update(last_error=f"Order page not reached (Qty {verified_qty}), retrying...")
                             continue
 
-                        # VERIFIED ON ORDER PAGE! Send Payment Page Screenshot + Copyable Codes in 1 HTML Message!
+                        # VERIFIED ON ORDER PAGE! Send Payment Page Screenshot + Copyable HTML Codes in 1 Message!
                         purchase_completed = True
+                        self.slot_bought_drop[slot_id] = active_drop_id
                         order_id = details.get("order_id") or "Confirmed"
                         codes = details.get("codes") or []
                         final_qty = details.get("actual_qty") or (len(codes) if codes else verified_qty)
@@ -2669,6 +2944,12 @@ class AccountController:
                                     pass
 
                         await self.browser.save_session(slot_id, account.phone_number)
+                        # Return quietly to product page so this tab stays pre-warmed for the next drop
+                        try:
+                            await page.goto(settings.product_url, wait_until="domcontentloaded", timeout=20000)
+                            await self._destroy_location_popup(page, slot_id)
+                        except Exception:
+                            pass
                         break
 
                     except Exception as flow_err:
@@ -2677,24 +2958,25 @@ class AccountController:
                         continue
 
                 if purchase_completed:
-                    await asyncio.sleep(6.0)
+                    await asyncio.sleep(4.0)
                 elif aborted_due_to_surge:
-                    await asyncio.sleep(8.0)
+                    await asyncio.sleep(15.0)
                 else:
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(2.0)
 
             except asyncio.CancelledError:
-                account.update(current_page="⏸️ Sniper Paused")
+                account.update(current_page="⏸️ Sniper Disarmed")
                 break
             except Exception as loop_err:
                 err_msg = str(loop_err)
-                log_step(slot_id, f"Sniper loop error: {err_msg[:60]}")
+                log_step(slot_id, f"Sniper worker note: {err_msg[:60]}")
                 account.update(
                     current_page="🛠️ [Auto-Healing Tab...]",
                     last_error=f"Self-Healed: {err_msg[:45]}",
                 )
                 try:
                     await self.browser.reset_slot_page(slot_id)
+                    await self.browser.open_product_page(slot_id)
                 except Exception:
                     pass
                 await asyncio.sleep(2.0)
@@ -2702,7 +2984,7 @@ class AccountController:
         self.sniper_tasks.pop(slot_id, None)
 
     async def _clear_stock_event_delayed(self):
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(1.5)
         self.stock_event.clear()
 
     # =========================================================
@@ -2717,7 +2999,7 @@ class AccountController:
             if target == "all":
                 started = self._ensure_snipers_running()
                 await update.message.reply_text(
-                    f"🔫 Swarm Sniper active/started! ({started} newly launched)\n"
+                    f"🔫 Swarm Armed! ({started} newly armed + 10s Light Monitor Active)\n"
                     f"🎯 Target: <code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> | "
                     f"🛡️ Abort: <code>{esc(self._abort_label())}</code>",
                     parse_mode="HTML",
@@ -2727,14 +3009,15 @@ class AccountController:
                 acc = self.get_account(slot_id)
                 if not acc.logged_in:
                     return await update.message.reply_text(f"❌ {slot_id} is not logged in!")
+                self._ensure_monitor_running()
                 task = self.sniper_tasks.get(slot_id)
                 if task is None or task.done():
                     self.sniper_tasks[slot_id] = asyncio.create_task(self._sniper_worker(slot_id))
                     await update.message.reply_text(
-                        f"🔫 Sniper started for <b>{esc(slot_id)}</b>", parse_mode="HTML"
+                        f"🔫 Quiet Standby Armed for <b>{esc(slot_id)}</b>", parse_mode="HTML"
                     )
                 else:
-                    await update.message.reply_text(f"✅ Sniper is already running on {slot_id}")
+                    await update.message.reply_text(f"✅ {slot_id} is already armed and waiting quietly!")
         except Exception as exc:
             await update.message.reply_text(f"❌ Error: {exc}")
 
@@ -2750,26 +3033,29 @@ class AccountController:
                         task.cancel()
                         stopped += 1
                     self.sniper_tasks.pop(slot_id, None)
-                await update.message.reply_text(f"⏸️ Paused sniper on {stopped} accounts.")
+                await update.message.reply_text(f"⏸️ Disarmed sniper on {stopped} accounts.")
             else:
                 slot_id = target.upper()
                 task = self.sniper_tasks.pop(slot_id, None)
                 if task and not task.done():
                     task.cancel()
-                    await update.message.reply_text(f"⏸️ Sniper paused for {slot_id}")
+                    await update.message.reply_text(f"⏸️ Disarmed sniper for {slot_id}")
                 else:
-                    await update.message.reply_text(f"ℹ️ Sniper was not running on {slot_id}")
+                    await update.message.reply_text(f"ℹ️ Sniper was not armed on {slot_id}")
         except Exception as exc:
             await update.message.reply_text(f"❌ Error: {exc}")
 
     async def trigger_stock_buy(self):
+        """Manual trigger increments drop_id so every armed logged-in account attacks immediately."""
+        self._ensure_snipers_running()
+        self.current_drop_id += 1
         self.stock_event.set()
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(1.5)
         self.stock_event.clear()
 
     async def handle_trigger_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            f"🚨 <b>SWARM TRIGGER SENT!</b>\nWaking up ALL accounts to attack "
+            f"🚨 <b>SWARM TRIGGER SENT!</b>\nWaking ALL accounts simultaneously to attack "
             f"<code>Rs.{esc(self.target_denom)} x {self.target_qty}</code> "
             f"(Abort: <code>{esc(self._abort_label())}</code>) NOW!",
             parse_mode="HTML",
